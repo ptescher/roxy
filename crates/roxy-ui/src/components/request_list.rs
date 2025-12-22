@@ -6,17 +6,36 @@
 use gpui::prelude::*;
 use gpui::*;
 use roxy_core::HttpRequestRecord;
+use std::sync::Arc;
 
-use crate::components::request_row::{format_bytes, RequestRowProps};
+use crate::components::request_row::format_bytes;
 use crate::theme::{colors, dimensions, font_size, spacing, Theme};
 
+/// Callback type for request selection
+pub type OnRequestSelect = Arc<dyn Fn(&HttpRequestRecord, &mut App) + Send + Sync + 'static>;
+
 /// Properties for the RequestList component
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RequestListProps {
     /// List of requests to display
     pub requests: Vec<HttpRequestRecord>,
     /// Currently selected request ID (if any)
     pub selected_request_id: Option<String>,
+    /// Callback when a request row is clicked
+    pub on_request_select: Option<OnRequestSelect>,
+    /// Scroll handle for the request list
+    pub scroll_handle: ScrollHandle,
+}
+
+impl Default for RequestListProps {
+    fn default() -> Self {
+        Self {
+            requests: Vec::new(),
+            selected_request_id: None,
+            on_request_select: None,
+            scroll_handle: ScrollHandle::new(),
+        }
+    }
 }
 
 /// Request list component
@@ -38,14 +57,16 @@ impl RequestList {
     pub fn render(&self) -> impl IntoElement {
         let requests = &self.props.requests;
 
+        // Fill the container completely - parent controls the size
         div()
             .flex()
             .flex_col()
-            .flex_1()
-            .min_h(px(200.0))
+            .size_full()
             .overflow_hidden()
-            .child(self.render_header())
-            .child(self.render_rows())
+            // Header - fixed height, no shrink
+            .child(div().flex_shrink_0().child(self.render_header()))
+            // Rows - fill remaining space
+            .child(div().flex_1().overflow_hidden().child(self.render_rows()))
             .when(requests.is_empty(), |this| {
                 this.child(self.render_empty_state())
             })
@@ -73,18 +94,30 @@ impl RequestList {
 
     /// Render all request rows
     fn render_rows(&self) -> impl IntoElement {
-        let requests = &self.props.requests;
-        let selected_id = &self.props.selected_request_id;
+        let requests = self.props.requests.clone();
+        let selected_id = self.props.selected_request_id.clone();
+        let on_select = self.props.on_request_select.clone();
+        let scroll_handle = self.props.scroll_handle.clone();
 
-        div().flex().flex_col().flex_1().overflow_hidden().children(
-            requests.iter().enumerate().map(|(index, request)| {
-                let is_selected = selected_id
-                    .as_ref()
-                    .map(|id| id == &request.id)
-                    .unwrap_or(false);
-                self.render_request_row(request, index, is_selected)
-            }),
-        )
+        div()
+            .size_full()
+            .bg(rgb(colors::BASE))
+            .id("request-list-rows")
+            .overflow_y_scroll()
+            .track_scroll(&scroll_handle)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .children(requests.iter().enumerate().map(|(index, request)| {
+                        let is_selected = selected_id
+                            .as_ref()
+                            .map(|id| id == &request.id)
+                            .unwrap_or(false);
+                        self.render_request_row(request, index, is_selected, on_select.clone())
+                    })),
+            )
     }
 
     /// Render a single request row
@@ -93,6 +126,7 @@ impl RequestList {
         request: &HttpRequestRecord,
         index: usize,
         selected: bool,
+        on_select: Option<OnRequestSelect>,
     ) -> impl IntoElement {
         let bg = if selected {
             rgb(colors::SURFACE_0)
@@ -111,7 +145,14 @@ impl RequestList {
             request.url.clone()
         };
 
-        div()
+        // Clone request data for the callback
+        let request_for_callback = request.clone();
+        let method = request.method.clone();
+        let status = request.response_status;
+        let duration = request.duration_ms;
+        let size = request.response_body_size;
+
+        let mut el = div()
             .flex()
             .items_center()
             .h(dimensions::REQUEST_ROW_HEIGHT)
@@ -125,13 +166,13 @@ impl RequestList {
                     .w(px(60.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(method_color)
-                    .child(request.method.clone()),
+                    .child(method),
             )
             .child(
                 div()
                     .w(px(60.0))
                     .text_color(status_color)
-                    .child(request.response_status.to_string()),
+                    .child(status.to_string()),
             )
             .child(
                 div()
@@ -144,14 +185,22 @@ impl RequestList {
                 div()
                     .w(px(80.0))
                     .text_color(self.theme.text_muted)
-                    .child(format!("{:.1}ms", request.duration_ms)),
+                    .child(format!("{:.1}ms", duration)),
             )
             .child(
                 div()
                     .w(px(80.0))
                     .text_color(self.theme.text_muted)
-                    .child(format_bytes(request.response_body_size)),
-            )
+                    .child(format_bytes(size)),
+            );
+
+        if let Some(callback) = on_select {
+            el = el.on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                callback(&request_for_callback, cx);
+            });
+        }
+
+        el
     }
 
     /// Render the empty state when no requests are available

@@ -583,6 +583,8 @@ ls -la target/release/roxy target/release/roxy-proxy
 - [x] Spawn and manage proxy subprocess
 - [x] Proxy status indicator
 - [x] Update notification banner
+- [x] Request row click to select and view details
+- [x] Host sidebar click to filter requests
 - [ ] Break out front end into proper reactive architecute with separate views, components, etc
 - [ ] Basic filtering (real time search)
 - [ ] Routing rules panel (create/edit/delete)
