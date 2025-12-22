@@ -1,0 +1,71 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo lock file (optional - typically included for binaries, excluded for libraries)
+# Cargo.lock
+
+# Debug files
+*.pdb
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Local configuration
+config.local.yaml
+config.local.toml
+
+# Generated certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Docker volumes (if mounted locally)
+.docker-data/
+
+# ClickHouse data (if running locally outside Docker)
+clickhouse-data/
+
+# Grafana data
+grafana-data/
+
+# Log files
+*.log
+logs/
+
+# Coverage reports
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Benchmark results
+criterion/
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Backup files
+*.bak
+*.backup
+
+# Temporary files
+*.tmp
+*.temp
+.cache/

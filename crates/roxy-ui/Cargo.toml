@@ -1,0 +1,42 @@
+[package]
+name = "roxy-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "roxy"
+path = "src/main.rs"
+
+[dependencies]
+# GPUI - Zed's GPU-accelerated UI framework
+gpui = "0.2.2"
+
+# Async runtime
+tokio = { workspace = true }
+
+# Internal crates
+roxy-core = { workspace = true }
+roxy-proxy = { path = "../roxy-proxy" }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+chrono = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+
+# UI utilities
+smallvec = "1.13"
+parking_lot = "0.12"
+futures = "0.3"
