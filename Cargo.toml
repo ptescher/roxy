@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/roxy-proxy",
+    "crates/roxy-ui",
+    "crates/roxy-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Roxy Contributors"]
+repository = "https://github.com/yourusername/roxy"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.44", features = ["full"] }
+
+# HTTP/Proxy
+hudsucker = { version = "0.23", features = ["rcgen-ca"] }
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http = "1.2"
+http-body-util = "0.1"
+rustls = "0.23"
+rcgen = "0.13"
+
+# HTTP Client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+
+# OpenTelemetry
+opentelemetry = "0.28"
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.28", features = ["tonic"] }
+
+# ClickHouse
+clickhouse = { version = "0.13", features = ["lz4"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.29"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.16", features = ["v4", "serde"] }
+url = "2.5"
+futures = "0.3"
+dirs = "6.0"
+async-trait = "0.1"
+rand = "0.8"
+base64 = "0.22"
+
+# Internal crates
+roxy-core = { path = "crates/roxy-core" }
