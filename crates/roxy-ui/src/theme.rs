@@ -218,4 +218,9 @@ pub mod dimensions {
 
     pub const STATUS_INDICATOR_SIZE: Pixels = px(10.0);
     pub const BORDER_RADIUS: Pixels = px(4.0);
+
+    /// Width of the resize handle for the sidebar
+    pub const RESIZE_HANDLE_WIDTH: Pixels = px(4.0);
+    /// Height of the resize handle for the detail panel
+    pub const RESIZE_HANDLE_HEIGHT: Pixels = px(4.0);
 }

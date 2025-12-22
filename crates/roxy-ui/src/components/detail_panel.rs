@@ -23,6 +23,8 @@ pub enum DetailTab {
     Response,
     /// Timing breakdown
     Timing,
+    /// Raw span data as JSON
+    Raw,
 }
 
 impl DetailTab {
@@ -33,6 +35,7 @@ impl DetailTab {
             DetailTab::Request => "Request",
             DetailTab::Response => "Response",
             DetailTab::Timing => "Timing",
+            DetailTab::Raw => "Raw",
         }
     }
 
@@ -43,17 +46,39 @@ impl DetailTab {
             DetailTab::Request,
             DetailTab::Response,
             DetailTab::Timing,
+            DetailTab::Raw,
         ]
     }
 }
 
+/// Callback type for tab selection
+pub type OnTabSelect = Arc<dyn Fn(DetailTab, &mut App) + Send + Sync + 'static>;
+
 /// Properties for the DetailPanel component
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DetailPanelProps {
     /// The selected request to display details for
     pub selected_request: Option<HttpRequestRecord>,
     /// Currently active tab
     pub active_tab: DetailTab,
+    /// Callback when a tab is clicked
+    pub on_tab_select: Option<OnTabSelect>,
+    /// Height of the detail panel in pixels
+    pub height: f32,
+    /// Scroll handle for the detail panel content
+    pub scroll_handle: ScrollHandle,
+}
+
+impl Default for DetailPanelProps {
+    fn default() -> Self {
+        Self {
+            selected_request: None,
+            active_tab: DetailTab::default(),
+            on_tab_select: None,
+            height: 300.0,
+            scroll_handle: ScrollHandle::new(),
+        }
+    }
 }
 
 /// Detail panel component
@@ -76,7 +101,7 @@ impl DetailPanel {
         div()
             .flex()
             .flex_col()
-            .h(dimensions::DETAIL_PANEL_HEIGHT)
+            .h(px(self.props.height))
             .border_t_1()
             .border_color(rgb(colors::SURFACE_0))
             .bg(rgb(colors::MANTLE))
@@ -86,6 +111,8 @@ impl DetailPanel {
 
     /// Render the tab bar
     fn render_tabs(&self) -> impl IntoElement {
+        let on_tab_select = self.props.on_tab_select.clone();
+
         div()
             .flex()
             .items_center()
@@ -94,11 +121,15 @@ impl DetailPanel {
             .gap(spacing::XXS)
             .border_b_1()
             .border_color(rgb(colors::SURFACE_0))
-            .children(DetailTab::all().iter().map(|tab| self.render_tab(*tab)))
+            .children(
+                DetailTab::all()
+                    .iter()
+                    .map(|tab| self.render_tab(*tab, on_tab_select.clone())),
+            )
     }
 
     /// Render a single tab
-    fn render_tab(&self, tab: DetailTab) -> impl IntoElement {
+    fn render_tab(&self, tab: DetailTab, on_select: Option<OnTabSelect>) -> impl IntoElement {
         let is_active = self.props.active_tab == tab;
 
         let bg = if is_active {
@@ -107,7 +138,7 @@ impl DetailPanel {
             rgba(colors::TRANSPARENT)
         };
 
-        div()
+        let mut el = div()
             .px(spacing::SM)
             .py(spacing::XXS)
             .rounded(dimensions::BORDER_RADIUS)
@@ -121,20 +152,32 @@ impl DetailPanel {
             })
             .cursor_pointer()
             .hover(|style| style.bg(rgb(colors::SURFACE_0)))
-            .child(tab.label())
+            .child(tab.label());
+
+        if let Some(callback) = on_select {
+            el = el.on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                callback(tab, cx);
+            });
+        }
+
+        el
     }
 
     /// Render the content area based on selected request and active tab
     fn render_content(&self) -> impl IntoElement {
+        let scroll_handle = self.props.scroll_handle.clone();
         match &self.props.selected_request {
             Some(request) => div()
                 .flex_1()
                 .p(spacing::MD)
-                .overflow_hidden()
+                .id("detail-panel-content")
+                .overflow_y_scroll()
+                .track_scroll(&scroll_handle)
                 .child(self.render_request_content(request)),
             None => div()
                 .flex_1()
                 .p(spacing::MD)
+                .id("detail-panel-empty")
                 .overflow_hidden()
                 .child(self.render_empty_state()),
         }
@@ -147,12 +190,14 @@ impl DetailPanel {
         let request_content = self.render_request_tab(request);
         let response_content = self.render_response_tab(request);
         let timing_content = self.render_timing_tab(request);
+        let raw_content = self.render_raw_tab(request);
 
         div().child(match self.props.active_tab {
             DetailTab::Headers => div().child(headers_content),
             DetailTab::Request => div().child(request_content),
             DetailTab::Response => div().child(response_content),
             DetailTab::Timing => div().child(timing_content),
+            DetailTab::Raw => div().child(raw_content),
         })
     }
 
@@ -239,51 +284,74 @@ impl DetailPanel {
 
     /// Render the request tab content (request body)
     fn render_request_tab(&self, request: &HttpRequestRecord) -> impl IntoElement {
-        self.render_body_content(&request.request_body, request.request_body_size)
+        self.render_body_content(
+            "Request Body",
+            &request.request_body,
+            request.request_body_size,
+        )
     }
 
     /// Render the response tab content (response body)
     fn render_response_tab(&self, request: &HttpRequestRecord) -> impl IntoElement {
-        self.render_body_content(&request.response_body, request.response_body_size)
+        self.render_body_content(
+            "Response Body",
+            &request.response_body,
+            request.response_body_size,
+        )
     }
 
     /// Render body content with size info
-    fn render_body_content(&self, body: &str, size: i64) -> impl IntoElement {
-        if body.is_empty() {
-            div()
-                .text_size(font_size::SM)
-                .text_color(self.theme.text_muted)
-                .child("(empty body)")
-        } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap(spacing::XS)
-                .child(
-                    div()
-                        .text_size(font_size::XS)
-                        .text_color(self.theme.text_muted)
-                        .child(format!("Size: {} bytes", size)),
-                )
-                .child(
-                    div()
-                        .p(spacing::XS)
-                        .rounded(dimensions::BORDER_RADIUS)
-                        .bg(rgb(colors::CRUST))
-                        .text_size(font_size::SM)
-                        .font_family("Berkeley Mono")
-                        .text_color(self.theme.text_primary)
-                        .overflow_hidden()
-                        .child(self.format_body(body)),
-                )
-        }
+    fn render_body_content(&self, title: &str, body: &str, size: i64) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(spacing::XS)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(font_size::SM)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(self.theme.text_secondary)
+                            .child(title.to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_size(font_size::XS)
+                            .text_color(self.theme.text_muted)
+                            .child(format_bytes(size)),
+                    ),
+            )
+            .child(if body.is_empty() {
+                div()
+                    .p(spacing::MD)
+                    .rounded(dimensions::BORDER_RADIUS)
+                    .bg(rgb(colors::CRUST))
+                    .text_size(font_size::SM)
+                    .text_color(self.theme.text_muted)
+                    .child("(empty body)")
+            } else {
+                div()
+                    .p(spacing::SM)
+                    .rounded(dimensions::BORDER_RADIUS)
+                    .bg(rgb(colors::CRUST))
+                    .text_size(font_size::SM)
+                    .font_family("Berkeley Mono")
+                    .text_color(self.theme.text_primary)
+                    .overflow_hidden()
+                    .child(self.format_body(body))
+            })
     }
 
     /// Format body content (try to pretty-print JSON)
     fn format_body(&self, body: &str) -> String {
         // Check if it's base64 encoded
         if body.starts_with("base64:") {
-            return format!("[Binary data: {} encoded]", &body[7..body.len().min(50)]);
+            let encoded_preview = &body[7..body.len().min(57)];
+            return format!("[Binary data, base64 encoded: {}...]", encoded_preview);
         }
 
         // Try to parse and pretty-print JSON
@@ -294,36 +362,112 @@ impl DetailPanel {
         }
     }
 
-    /// Render the timing tab content
-    fn render_timing_tab(&self, request: &HttpRequestRecord) -> impl IntoElement {
+    /// Render the raw tab content (full span as JSON)
+    fn render_raw_tab(&self, request: &HttpRequestRecord) -> impl IntoElement {
+        let json = serde_json::to_string_pretty(request)
+            .unwrap_or_else(|e| format!("Error serializing: {}", e));
+
         div()
             .flex()
             .flex_col()
             .gap(spacing::XS)
-            .child(self.render_info_row("Total Duration", &format!("{:.2}ms", request.duration_ms)))
-            .child(self.render_timing_bar(request.duration_ms))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(font_size::SM)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(self.theme.text_secondary)
+                            .child("Raw Span Data"),
+                    )
+                    .child(
+                        div()
+                            .text_size(font_size::XS)
+                            .text_color(self.theme.text_muted)
+                            .child(format!("{} bytes", json.len())),
+                    ),
+            )
+            .child(
+                div()
+                    .p(spacing::SM)
+                    .rounded(dimensions::BORDER_RADIUS)
+                    .bg(rgb(colors::CRUST))
+                    .text_size(font_size::SM)
+                    .font_family("Berkeley Mono")
+                    .text_color(self.theme.text_primary)
+                    .overflow_hidden()
+                    .child(json),
+            )
+    }
+
+    /// Render the timing tab content
+    fn render_timing_tab(&self, request: &HttpRequestRecord) -> impl IntoElement {
+        div().flex().flex_col().gap(spacing::MD).child(
+            self.render_section(
+                "Timing Overview",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(spacing::XS)
+                    .child(self.render_info_row(
+                        "Total Duration",
+                        &format!("{:.2}ms", request.duration_ms),
+                    ))
+                    .child(self.render_timing_bar(
+                        "Total",
+                        request.duration_ms,
+                        request.duration_ms,
+                    )),
+            ),
+        )
     }
 
     /// Render a visual timing bar
-    fn render_timing_bar(&self, duration_ms: f64) -> impl IntoElement {
-        let bar_width = (duration_ms.min(1000.0) / 1000.0 * 200.0) as f32;
+    fn render_timing_bar(
+        &self,
+        label: &str,
+        duration_ms: f64,
+        max_duration: f64,
+    ) -> impl IntoElement {
+        let bar_width = if max_duration > 0.0 {
+            (duration_ms / max_duration * 300.0).min(300.0) as f32
+        } else {
+            0.0
+        };
 
         div()
             .flex()
             .items_center()
-            .gap(spacing::XS)
-            .mt(spacing::XS)
+            .gap(spacing::SM)
             .child(
                 div()
-                    .h(px(8.0))
-                    .w(px(bar_width))
-                    .rounded(dimensions::BORDER_RADIUS)
-                    .bg(self.theme.info),
+                    .w(px(80.0))
+                    .text_size(font_size::SM)
+                    .text_color(self.theme.text_muted)
+                    .child(label.to_string()),
             )
             .child(
                 div()
-                    .text_size(font_size::XS)
-                    .text_color(self.theme.text_muted)
+                    .flex_1()
+                    .h(px(20.0))
+                    .rounded(dimensions::BORDER_RADIUS)
+                    .bg(rgb(colors::SURFACE_0))
+                    .child(
+                        div()
+                            .h(px(20.0))
+                            .w(px(bar_width))
+                            .rounded(dimensions::BORDER_RADIUS)
+                            .bg(self.theme.info),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(80.0))
+                    .text_size(font_size::SM)
+                    .text_color(self.theme.text_primary)
                     .child(format!("{:.2}ms", duration_ms)),
             )
     }
@@ -354,6 +498,21 @@ impl DetailPanel {
             .text_size(font_size::MD)
             .text_color(self.theme.text_muted)
             .child("Select a request to view details")
+    }
+}
+
+/// Format bytes to human-readable string
+fn format_bytes(bytes: i64) -> String {
+    if bytes < 0 {
+        "0 B".to_string()
+    } else if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 

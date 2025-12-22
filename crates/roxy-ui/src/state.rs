@@ -3,6 +3,8 @@
 //! This module contains the core state management types including
 //! the application state, UI messages, and proxy status.
 
+use crate::components::DetailTab;
+use gpui::ScrollHandle;
 use roxy_core::{ClickHouseConfig, HostSummary, HttpRequestRecord, RoxyClickHouse};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -58,6 +60,20 @@ impl ProxyStatus {
     }
 }
 
+/// Default sidebar width in pixels
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 220.0;
+/// Minimum sidebar width in pixels
+pub const MIN_SIDEBAR_WIDTH: f32 = 150.0;
+/// Maximum sidebar width in pixels
+pub const MAX_SIDEBAR_WIDTH: f32 = 400.0;
+
+/// Default detail panel height in pixels
+pub const DEFAULT_DETAIL_PANEL_HEIGHT: f32 = 300.0;
+/// Minimum detail panel height in pixels
+pub const MIN_DETAIL_PANEL_HEIGHT: f32 = 100.0;
+/// Maximum detail panel height in pixels
+pub const MAX_DETAIL_PANEL_HEIGHT: f32 = 600.0;
+
 /// Application state shared across the UI
 pub struct AppState {
     /// ClickHouse client for querying data
@@ -81,6 +97,9 @@ pub struct AppState {
     /// Currently selected request for detail view
     pub selected_request: Option<HttpRequestRecord>,
 
+    /// Currently active tab in detail panel
+    pub active_detail_tab: DetailTab,
+
     /// Error message to display in status bar
     pub error_message: Option<String>,
 
@@ -92,6 +111,27 @@ pub struct AppState {
 
     /// Channel sender for UI messages (cloned for background tasks)
     pub message_tx: mpsc::UnboundedSender<UiMessage>,
+
+    /// Current sidebar width in pixels (resizable)
+    pub sidebar_width: f32,
+
+    /// Current detail panel height in pixels (resizable)
+    pub detail_panel_height: f32,
+
+    /// Whether the sidebar is currently being resized
+    pub is_resizing_sidebar: bool,
+
+    /// Whether the detail panel is currently being resized
+    pub is_resizing_detail_panel: bool,
+
+    /// Scroll handle for the request list
+    pub request_list_scroll_handle: ScrollHandle,
+
+    /// Scroll handle for the sidebar hosts
+    pub sidebar_scroll_handle: ScrollHandle,
+
+    /// Scroll handle for the detail panel content
+    pub detail_panel_scroll_handle: ScrollHandle,
 }
 
 impl AppState {
@@ -108,10 +148,18 @@ impl AppState {
             requests: Vec::new(),
             selected_host: None,
             selected_request: None,
+            active_detail_tab: DetailTab::default(),
             error_message: None,
             update_available: None,
             message_rx: Some(message_rx),
             message_tx,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            detail_panel_height: DEFAULT_DETAIL_PANEL_HEIGHT,
+            is_resizing_sidebar: false,
+            is_resizing_detail_panel: false,
+            request_list_scroll_handle: ScrollHandle::new(),
+            sidebar_scroll_handle: ScrollHandle::new(),
+            detail_panel_scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -204,6 +252,41 @@ impl AppState {
             Some(host) => self.requests.iter().filter(|r| &r.host == host).collect(),
             None => self.requests.iter().collect(),
         }
+    }
+
+    /// Set the active detail tab
+    pub fn set_detail_tab(&mut self, tab: DetailTab) {
+        self.active_detail_tab = tab;
+    }
+
+    /// Set the sidebar width, clamping to min/max bounds
+    pub fn set_sidebar_width(&mut self, width: f32) {
+        self.sidebar_width = width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    }
+
+    /// Set the detail panel height, clamping to min/max bounds
+    pub fn set_detail_panel_height(&mut self, height: f32) {
+        self.detail_panel_height = height.clamp(MIN_DETAIL_PANEL_HEIGHT, MAX_DETAIL_PANEL_HEIGHT);
+    }
+
+    /// Start resizing the sidebar
+    pub fn start_resizing_sidebar(&mut self) {
+        self.is_resizing_sidebar = true;
+    }
+
+    /// Stop resizing the sidebar
+    pub fn stop_resizing_sidebar(&mut self) {
+        self.is_resizing_sidebar = false;
+    }
+
+    /// Start resizing the detail panel
+    pub fn start_resizing_detail_panel(&mut self) {
+        self.is_resizing_detail_panel = true;
+    }
+
+    /// Stop resizing the detail panel
+    pub fn stop_resizing_detail_panel(&mut self) {
+        self.is_resizing_detail_panel = false;
     }
 }
 

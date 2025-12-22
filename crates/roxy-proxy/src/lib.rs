@@ -37,8 +37,6 @@ pub struct ProxyConfig {
     pub start_services: bool,
     /// ClickHouse configuration
     pub clickhouse: ClickHouseConfig,
-    /// Maximum body size to capture (default 1MB)
-    pub max_body_capture_size: usize,
 }
 
 impl Default for ProxyConfig {
@@ -48,7 +46,6 @@ impl Default for ProxyConfig {
             configure_system_proxy: false,
             start_services: true,
             clickhouse: ClickHouseConfig::default(),
-            max_body_capture_size: 1024 * 1024, // 1MB
         }
     }
 }
@@ -78,7 +75,6 @@ struct ProxyState {
     request_count: AtomicU64,
     /// Pending requests keyed by client address, stored as a queue for keep-alive connections
     pending_requests: RwLock<HashMap<SocketAddr, VecDeque<PendingRequest>>>,
-    max_body_size: usize,
 }
 
 /// HTTP handler that intercepts and logs requests
@@ -105,16 +101,12 @@ impl RoxyHttpHandler {
         serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// Extract body bytes, respecting size limit
-    async fn extract_body(body: Body, max_size: usize) -> (Vec<u8>, Body) {
+    /// Extract full body bytes for logging
+    async fn extract_body(body: Body) -> (Vec<u8>, Body) {
         match body.collect().await {
             Ok(collected) => {
                 let bytes = collected.to_bytes();
-                let captured = if bytes.len() > max_size {
-                    bytes[..max_size].to_vec()
-                } else {
-                    bytes.to_vec()
-                };
+                let captured = bytes.to_vec();
                 // Recreate the body for forwarding using Full
                 let new_body = Body::from(http_body_util::Full::new(bytes));
                 (captured, new_body)
@@ -181,7 +173,7 @@ impl HttpHandler for RoxyHttpHandler {
 
         // Capture body
         let (parts, body) = req.into_parts();
-        let (body_bytes, new_body) = Self::extract_body(body, self.state.max_body_size).await;
+        let (body_bytes, new_body) = Self::extract_body(body).await;
         let request_body_size = body_bytes.len() as i64;
         let request_body = Self::body_to_string(&body_bytes);
 
@@ -260,7 +252,7 @@ impl HttpHandler for RoxyHttpHandler {
 
         // Capture response body
         let (parts, body) = res.into_parts();
-        let (body_bytes, new_body) = Self::extract_body(body, self.state.max_body_size).await;
+        let (body_bytes, new_body) = Self::extract_body(body).await;
         let response_body_size = body_bytes.len() as i64;
         let response_body = Self::body_to_string(&body_bytes);
 
@@ -456,7 +448,6 @@ impl ProxyServer {
             clickhouse,
             request_count: AtomicU64::new(0),
             pending_requests: RwLock::new(HashMap::new()),
-            max_body_size: config.max_body_capture_size,
         });
 
         Ok(Self {
