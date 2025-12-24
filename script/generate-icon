@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+#
+# Generate placeholder app icons for Roxy
+# This creates simple SVG and PNG icons for development.
+# For production, replace with professionally designed icons.
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+RESOURCES_DIR="${PROJECT_ROOT}/crates/roxy-ui/resources"
+
+# Icon sizes needed for macOS
+ICON_SIZES=(16 32 64 128 256 512 1024)
+
+echo "🎨 Generating Roxy app icons..."
+
+# Create resources directory if it doesn't exist
+mkdir -p "$RESOURCES_DIR"
+
+# Check for required tools
+if ! command -v convert &> /dev/null && ! command -v rsvg-convert &> /dev/null; then
+    echo ""
+    echo "⚠️  Neither ImageMagick nor librsvg is installed."
+    echo ""
+    echo "To generate PNG icons, install one of:"
+    echo "  brew install imagemagick"
+    echo "  brew install librsvg"
+    echo ""
+    echo "Creating SVG only..."
+    HAS_CONVERTER=false
+else
+    HAS_CONVERTER=true
+fi
+
+# Create an SVG icon
+# A simple design: rounded rectangle with "R" letter and network-inspired styling
+cat > "${RESOURCES_DIR}/app-icon.svg" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Main gradient - deep purple to blue -->
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366f1"/>
+      <stop offset="50%" style="stop-color:#8b5cf6"/>
+      <stop offset="100%" style="stop-color:#a855f7"/>
+    </linearGradient>
+
+    <!-- Subtle inner shadow -->
+    <linearGradient id="innerShadow" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:rgba(255,255,255,0.2)"/>
+      <stop offset="100%" style="stop-color:rgba(0,0,0,0.1)"/>
+    </linearGradient>
+
+    <!-- Drop shadow filter -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="20" flood-color="rgba(0,0,0,0.3)"/>
+    </filter>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect x="64" y="64" width="896" height="896" rx="180" ry="180"
+        fill="url(#bgGradient)" filter="url(#shadow)"/>
+
+  <!-- Inner highlight -->
+  <rect x="80" y="80" width="864" height="432" rx="170" ry="170"
+        fill="url(#innerShadow)" opacity="0.5"/>
+
+  <!-- Network nodes (decorative circles) -->
+  <circle cx="280" cy="280" r="40" fill="rgba(255,255,255,0.15)"/>
+  <circle cx="744" cy="280" r="30" fill="rgba(255,255,255,0.1)"/>
+  <circle cx="280" cy="744" r="25" fill="rgba(255,255,255,0.1)"/>
+  <circle cx="744" cy="744" r="35" fill="rgba(255,255,255,0.12)"/>
+
+  <!-- Connection lines (network-inspired) -->
+  <line x1="280" y1="280" x2="744" y2="280" stroke="rgba(255,255,255,0.08)" stroke-width="4"/>
+  <line x1="280" y1="280" x2="280" y2="744" stroke="rgba(255,255,255,0.08)" stroke-width="4"/>
+  <line x1="280" y1="280" x2="744" y2="744" stroke="rgba(255,255,255,0.06)" stroke-width="3"/>
+
+  <!-- Main "R" letter -->
+  <text x="512" y="620"
+        font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', sans-serif"
+        font-size="480"
+        font-weight="700"
+        fill="white"
+        text-anchor="middle"
+        opacity="0.95">R</text>
+
+  <!-- Small arrow/proxy indicator -->
+  <path d="M680 680 L760 600 L760 660 L820 660 L820 700 L760 700 L760 760 Z"
+        fill="rgba(255,255,255,0.8)"/>
+</svg>
+EOF
+
+echo "   ✅ Created app-icon.svg"
+
+if [[ "$HAS_CONVERTER" = true ]]; then
+    echo ""
+    echo "📐 Generating PNG icons..."
+
+    # Generate PNGs at various sizes
+    for size in "${ICON_SIZES[@]}"; do
+        output_file="${RESOURCES_DIR}/app-icon-${size}.png"
+
+        if command -v rsvg-convert &> /dev/null; then
+            rsvg-convert -w "$size" -h "$size" \
+                "${RESOURCES_DIR}/app-icon.svg" \
+                -o "$output_file"
+        elif command -v convert &> /dev/null; then
+            convert -background none \
+                -resize "${size}x${size}" \
+                "${RESOURCES_DIR}/app-icon.svg" \
+                "$output_file"
+        fi
+
+        echo "   ✅ app-icon-${size}.png"
+    done
+
+    # Create the standard and @2x versions for cargo-bundle
+    cp "${RESOURCES_DIR}/app-icon-512.png" "${RESOURCES_DIR}/app-icon.png"
+    cp "${RESOURCES_DIR}/app-icon-1024.png" "${RESOURCES_DIR}/app-icon@2x.png"
+
+    echo ""
+    echo "   ✅ app-icon.png (512x512)"
+    echo "   ✅ app-icon@2x.png (1024x1024)"
+
+    # Generate .icns file for macOS if iconutil is available
+    if command -v iconutil &> /dev/null; then
+        echo ""
+        echo "🍎 Generating macOS .icns file..."
+
+        iconset_dir="${RESOURCES_DIR}/AppIcon.iconset"
+        mkdir -p "$iconset_dir"
+
+        # Copy icons with correct naming for iconutil
+        cp "${RESOURCES_DIR}/app-icon-16.png" "${iconset_dir}/icon_16x16.png"
+        cp "${RESOURCES_DIR}/app-icon-32.png" "${iconset_dir}/icon_16x16@2x.png"
+        cp "${RESOURCES_DIR}/app-icon-32.png" "${iconset_dir}/icon_32x32.png"
+        cp "${RESOURCES_DIR}/app-icon-64.png" "${iconset_dir}/icon_32x32@2x.png"
+        cp "${RESOURCES_DIR}/app-icon-128.png" "${iconset_dir}/icon_128x128.png"
+        cp "${RESOURCES_DIR}/app-icon-256.png" "${iconset_dir}/icon_128x128@2x.png"
+        cp "${RESOURCES_DIR}/app-icon-256.png" "${iconset_dir}/icon_256x256.png"
+        cp "${RESOURCES_DIR}/app-icon-512.png" "${iconset_dir}/icon_256x256@2x.png"
+        cp "${RESOURCES_DIR}/app-icon-512.png" "${iconset_dir}/icon_512x512.png"
+        cp "${RESOURCES_DIR}/app-icon-1024.png" "${iconset_dir}/icon_512x512@2x.png"
+
+        iconutil -c icns "$iconset_dir" -o "${RESOURCES_DIR}/AppIcon.icns"
+        rm -rf "$iconset_dir"
+
+        echo "   ✅ AppIcon.icns"
+    fi
+fi
+
+echo ""
+echo "✅ Icon generation complete!"
+echo ""
+echo "Generated files in ${RESOURCES_DIR}:"
+ls -la "${RESOURCES_DIR}"/app-icon* "${RESOURCES_DIR}"/AppIcon.icns 2>/dev/null || ls -la "${RESOURCES_DIR}"/app-icon*
+
+echo ""
+echo "💡 For production, replace these with professionally designed icons."

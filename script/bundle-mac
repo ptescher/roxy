@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Configuration
+APP_NAME="Roxy"
+BUNDLE_ID="dev.roxy.app"
+
+# Build options
+build_flag="--release"
+target_dir="release"
+open_result=false
+local_install=false
+can_code_sign=false
+
+# Code signing identity (set via environment or leave empty for ad-hoc)
+IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
+
+# Function for displaying help info
+help_info() {
+    echo "
+Usage: ${0##*/} [options] [architecture]
+Build the Roxy.app bundle for macOS.
+
+Options:
+  -d    Compile in debug mode
+  -o    Open the result (app in debug mode, directory with DMG in release)
+  -i    Install the app to /Applications
+  -h    Display this help and exit
+
+Architecture:
+  Defaults to host architecture. Can be:
+  - aarch64-apple-darwin (Apple Silicon)
+  - x86_64-apple-darwin (Intel)
+
+Environment Variables:
+  MACOS_SIGNING_IDENTITY    Code signing identity (e.g., 'Developer ID Application: Your Name')
+  MACOS_CERTIFICATE         Base64-encoded .p12 certificate (for CI)
+  MACOS_CERTIFICATE_PASSWORD Password for the certificate
+  APPLE_NOTARIZATION_KEY    API key for notarization
+  APPLE_NOTARIZATION_KEY_ID API key ID
+  APPLE_NOTARIZATION_ISSUER_ID Issuer ID for notarization
+"
+}
+
+while getopts 'doih' flag; do
+    case "${flag}" in
+        d)
+            export CARGO_INCREMENTAL=true
+            export CARGO_BUNDLE_SKIP_BUILD=true
+            build_flag=""
+            target_dir="debug"
+            ;;
+        o) open_result=true ;;
+        i) local_install=true ;;
+        h)
+            help_info
+            exit 0
+            ;;
+        *)
+            help_info
+            exit 1
+            ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+# Determine target architecture
+version_info=$(rustc --version --verbose)
+host_line=$(echo "$version_info" | grep host)
+target_triple=${host_line#*: }
+
+if [[ $# -gt 0 && -n "$1" ]]; then
+    target_triple="$1"
+fi
+
+arch_suffix=""
+if [[ "$target_triple" = "x86_64-apple-darwin" ]]; then
+    arch_suffix="x86_64"
+elif [[ "$target_triple" = "aarch64-apple-darwin" ]]; then
+    arch_suffix="aarch64"
+else
+    echo "Error: Unsupported architecture: $target_triple"
+    echo "Supported: x86_64-apple-darwin, aarch64-apple-darwin"
+    exit 1
+fi
+
+echo "🔨 Building ${APP_NAME} for macOS (${target_triple})..."
+
+# Check for cargo-bundle
+cargo_bundle_version=$(cargo bundle --help 2>&1 | head -n 1 || echo "")
+if [[ -z "$cargo_bundle_version" ]]; then
+    echo "📦 Installing cargo-bundle..."
+    cargo install cargo-bundle
+fi
+
+# Ensure target is available
+rustup target add "$target_triple" 2>/dev/null || true
+
+# Build the binary
+echo ""
+echo "📦 Compiling Roxy binary (${target_dir})..."
+if [[ -n "$build_flag" ]]; then
+    cargo build ${build_flag} --package roxy-ui --target "$target_triple"
+else
+    cargo build --package roxy-ui --target "$target_triple"
+fi
+
+# Create app bundle
+echo ""
+echo "🎁 Creating application bundle..."
+pushd crates/roxy-ui > /dev/null
+
+if [[ -n "$build_flag" ]]; then
+    app_path=$(cargo bundle ${build_flag} --target "$target_triple" 2>&1 | grep -E "\.app$" | tail -1 | xargs)
+else
+    app_path=$(cargo bundle --target "$target_triple" 2>&1 | grep -E "\.app$" | tail -1 | xargs)
+fi
+
+popd > /dev/null
+
+if [[ -z "$app_path" || ! -d "$app_path" ]]; then
+    # Fallback: construct the expected path
+    app_path="target/${target_triple}/${target_dir}/bundle/osx/${APP_NAME}.app"
+fi
+
+echo "   Bundle created: ${app_path}"
+
+# Check if we can code sign
+if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
+    echo ""
+    echo "🔐 Setting up keychain for code signing..."
+
+    security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" roxy.keychain 2>/dev/null || true
+    security default-keychain -s roxy.keychain
+    security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" roxy.keychain
+    security set-keychain-settings roxy.keychain
+
+    echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/roxy-certificate.p12
+    security import /tmp/roxy-certificate.p12 -k roxy.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+    rm /tmp/roxy-certificate.p12
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" roxy.keychain
+
+    IDENTITY=$(security find-identity -v -p codesigning roxy.keychain | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}')
+
+    function cleanup_keychain() {
+        echo "Cleaning up keychain..."
+        security default-keychain -s login.keychain
+        security delete-keychain roxy.keychain 2>/dev/null || true
+    }
+    trap cleanup_keychain EXIT
+
+    can_code_sign=true
+elif [[ -n "$IDENTITY" ]]; then
+    can_code_sign=true
+fi
+
+# Code sign the app
+echo ""
+if [[ "$can_code_sign" = true && -n "$IDENTITY" ]]; then
+    echo "🔏 Code signing with: ${IDENTITY}..."
+
+    entitlements_path="crates/roxy-ui/resources/roxy.entitlements"
+
+    if [[ -f "$entitlements_path" ]]; then
+        /usr/bin/codesign --force --deep --timestamp --options runtime \
+            --entitlements "$entitlements_path" \
+            --sign "$IDENTITY" \
+            "${app_path}" -v
+    else
+        /usr/bin/codesign --force --deep --timestamp --options runtime \
+            --sign "$IDENTITY" \
+            "${app_path}" -v
+    fi
+
+    echo "   ✅ Signed successfully"
+else
+    echo "🔏 Code signing with ad-hoc signature..."
+    codesign --force --deep --sign - "${app_path}"
+    echo "   ⚠️  Ad-hoc signed (some features may not work without proper signing)"
+fi
+
+# Handle installation or opening
+bundle_name=$(basename "$app_path")
+
+if [[ "$local_install" = true ]]; then
+    echo ""
+    echo "📲 Installing to /Applications..."
+    rm -rf "/Applications/${bundle_name}"
+    cp -R "$app_path" "/Applications/${bundle_name}"
+    echo "   ✅ Installed: /Applications/${bundle_name}"
+
+    if [[ "$open_result" = true ]]; then
+        echo "   Opening application..."
+        open "/Applications/${bundle_name}"
+    fi
+
+    echo ""
+    echo "✅ Build and install complete!"
+    exit 0
+fi
+
+# For release builds, create a DMG
+if [[ "$target_dir" = "release" ]]; then
+    echo ""
+    echo "💿 Creating DMG..."
+
+    dmg_target_directory="target/${target_triple}/${target_dir}"
+    dmg_source_directory="${dmg_target_directory}/dmg"
+    dmg_file_path="${dmg_target_directory}/${APP_NAME}-${arch_suffix}.dmg"
+
+    rm -rf "${dmg_source_directory}"
+    mkdir -p "${dmg_source_directory}"
+    cp -R "${app_path}" "${dmg_source_directory}/"
+    ln -s /Applications "${dmg_source_directory}/Applications"
+
+    hdiutil create -volname "${APP_NAME}" \
+        -srcfolder "${dmg_source_directory}" \
+        -ov -format UDZO \
+        "${dmg_file_path}"
+
+    # Clean up symlink
+    rm "${dmg_source_directory}/Applications"
+
+    echo "   ✅ DMG created: ${dmg_file_path}"
+
+    # Notarize if credentials are available
+    if [[ "$can_code_sign" = true && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+        echo ""
+        echo "📤 Notarizing DMG..."
+
+        /usr/bin/codesign --force --timestamp --options runtime --sign "$IDENTITY" "${dmg_file_path}" -v
+
+        notarization_key_file=$(mktemp)
+        echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
+
+        xcrun notarytool submit --wait \
+            --key "$notarization_key_file" \
+            --key-id "$APPLE_NOTARIZATION_KEY_ID" \
+            --issuer "$APPLE_NOTARIZATION_ISSUER_ID" \
+            "${dmg_file_path}"
+
+        rm "$notarization_key_file"
+
+        xcrun stapler staple "${dmg_file_path}"
+        echo "   ✅ Notarized and stapled"
+    fi
+
+    if [[ "$open_result" = true ]]; then
+        open "${dmg_target_directory}"
+    fi
+
+    echo ""
+    echo "✅ Build complete!"
+    echo ""
+    echo "Outputs:"
+    echo "   App:  ${app_path}"
+    echo "   DMG:  ${dmg_file_path}"
+else
+    # Debug build - just open the app
+    if [[ "$open_result" = true ]]; then
+        open "$app_path"
+    fi
+
+    echo ""
+    echo "✅ Debug build complete!"
+    echo "   App: ${app_path}"
+fi

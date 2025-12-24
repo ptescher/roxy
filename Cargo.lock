@@ -5028,8 +5028,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "cocoa 0.26.0",
  "futures",
  "gpui",
+ "objc",
  "parking_lot",
  "roxy-core",
  "roxy-proxy",

@@ -11,14 +11,25 @@ mod theme;
 use gpui::prelude::*;
 use gpui::*;
 use roxy_core::{ClickHouseConfig, RoxyClickHouse, CURRENT_VERSION};
+
+#[cfg(target_os = "macos")]
+use cocoa::{
+    appkit::{NSApp, NSImage},
+    base::{id, nil},
+    foundation::NSData,
+};
+#[cfg(target_os = "macos")]
+use objc::{msg_send, sel, sel_impl};
+
 use roxy_proxy::{ProxyConfig, ProxyServer};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use components::{
-    DetailPanel, DetailPanelProps, DetailTab, RequestList, RequestListProps, Sidebar, SidebarProps,
-    StatusBar, StatusBarProps, TitleBar, TitleBarProps, Toolbar, ToolbarProps,
+    open_about_window, DetailPanel, DetailPanelProps, DetailTab, RequestList, RequestListProps,
+    Sidebar, SidebarProps, StatusBar, StatusBarProps, TitleBar, TitleBarProps, Toolbar,
+    ToolbarProps,
 };
 use state::{AppState, ProxyStatus, UiMessage};
 use theme::{colors, dimensions};
@@ -216,7 +227,7 @@ impl RoxyApp {
             let entity = entity.clone();
             Arc::new(move |host: &str, cx: &mut App| {
                 let host = host.to_string();
-                let _ = entity.update(cx, |app, cx| {
+                entity.update(cx, |app, cx| {
                     app.state.select_host(host);
                     cx.notify();
                 });
@@ -226,7 +237,7 @@ impl RoxyApp {
         let on_clear_filter: Arc<dyn Fn(&mut App) + Send + Sync + 'static> = {
             let entity = entity.clone();
             Arc::new(move |cx: &mut App| {
-                let _ = entity.update(cx, |app, cx| {
+                entity.update(cx, |app, cx| {
                     app.state.clear_host_filter();
                     cx.notify();
                 });
@@ -258,7 +269,7 @@ impl RoxyApp {
             .on_mouse_down(MouseButton::Left, {
                 let entity = entity.clone();
                 move |_event, _window, cx| {
-                    let _ = entity.update(cx, |app, cx| {
+                    entity.update(cx, |app, cx| {
                         app.state.start_resizing_sidebar();
                         cx.notify();
                     });
@@ -279,7 +290,7 @@ impl RoxyApp {
             .on_mouse_down(MouseButton::Left, {
                 let entity = entity.clone();
                 move |_event, _window, cx| {
-                    let _ = entity.update(cx, |app, cx| {
+                    entity.update(cx, |app, cx| {
                         app.state.start_resizing_detail_panel();
                         cx.notify();
                     });
@@ -339,7 +350,7 @@ impl RoxyApp {
         > = Arc::new(
             move |request: &roxy_core::HttpRequestRecord, cx: &mut App| {
                 let request = request.clone();
-                let _ = entity.update(cx, |app, cx| {
+                entity.update(cx, |app, cx| {
                     app.state.select_request(request);
                     cx.notify();
                 });
@@ -371,7 +382,7 @@ impl RoxyApp {
         let entity = cx.entity().clone();
         let on_tab_select: Arc<dyn Fn(DetailTab, &mut App) + Send + Sync + 'static> =
             Arc::new(move |tab: DetailTab, cx: &mut App| {
-                let _ = entity.update(cx, |app, cx| {
+                entity.update(cx, |app, cx| {
                     app.state.set_detail_tab(tab);
                     cx.notify();
                 });
@@ -435,7 +446,7 @@ impl Render for RoxyApp {
             .on_mouse_move({
                 let entity = entity.clone();
                 move |event, _window, cx| {
-                    let _ = entity.update(cx, |app, cx| {
+                    entity.update(cx, |app, cx| {
                         let mut changed = false;
                         if app.state.is_resizing_sidebar {
                             let new_width: f32 = event.position.x.into();
@@ -462,7 +473,7 @@ impl Render for RoxyApp {
             .on_mouse_up(MouseButton::Left, {
                 let entity = entity.clone();
                 move |_event, _window, cx| {
-                    let _ = entity.update(cx, |app, cx| {
+                    entity.update(cx, |app, cx| {
                         if app.state.is_resizing_sidebar || app.state.is_resizing_detail_panel {
                             app.state.stop_resizing_sidebar();
                             app.state.stop_resizing_detail_panel();
@@ -474,6 +485,49 @@ impl Render for RoxyApp {
 
         container
     }
+}
+
+/// Set the dock icon programmatically for development builds
+/// This is needed when running outside of an app bundle
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    // Try to load the icon from the resources directory
+    let icon_paths = [
+        // When running from project root
+        "crates/roxy-ui/resources/app-icon@2x.png",
+        "crates/roxy-ui/resources/app-icon.png",
+        // When running from crates/roxy-ui
+        "resources/app-icon@2x.png",
+        "resources/app-icon.png",
+    ];
+
+    for path in &icon_paths {
+        if let Ok(data) = std::fs::read(path) {
+            unsafe {
+                let ns_data: id = NSData::dataWithBytes_length_(
+                    nil,
+                    data.as_ptr() as *const std::ffi::c_void,
+                    data.len() as u64,
+                );
+                if ns_data != nil {
+                    let ns_image: id = NSImage::initWithData_(NSImage::alloc(nil), ns_data);
+                    if ns_image != nil {
+                        let app: id = NSApp();
+                        let _: () = msg_send![app, setApplicationIconImage: ns_image];
+                        tracing::debug!("Set dock icon from: {}", path);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::debug!("No icon file found, using default icon");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {
+    // No-op on non-macOS platforms
 }
 
 fn main() {
@@ -489,6 +543,9 @@ fn main() {
         .init();
 
     tracing::info!("Starting Roxy UI v{}", CURRENT_VERSION);
+
+    // Set the dock icon for development builds (when not running as .app bundle)
+    set_dock_icon();
 
     Application::new().run(|cx: &mut App| {
         // Set up the macOS menu bar
@@ -520,8 +577,8 @@ fn main() {
             cx.quit();
         });
 
-        cx.on_action(|_: &About, _cx| {
-            tracing::info!("Roxy v{} - Network Debugger", CURRENT_VERSION);
+        cx.on_action(|_: &About, cx| {
+            open_about_window(cx);
         });
 
         cx.on_action(|_: &ClearRequests, _cx| {
@@ -556,7 +613,7 @@ fn main() {
             ..Default::default()
         };
 
-        cx.open_window(window_options, |_, cx| cx.new(|cx| RoxyApp::new(cx)))
+        cx.open_window(window_options, |_, cx| cx.new(RoxyApp::new))
             .expect("Failed to open window");
     });
 }

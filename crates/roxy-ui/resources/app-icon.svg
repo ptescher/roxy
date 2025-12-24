@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Main gradient - deep purple to blue -->
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366f1"/>
+      <stop offset="50%" style="stop-color:#8b5cf6"/>
+      <stop offset="100%" style="stop-color:#a855f7"/>
+    </linearGradient>
+
+    <!-- Subtle inner shadow -->
+    <linearGradient id="innerShadow" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:rgba(255,255,255,0.2)"/>
+      <stop offset="100%" style="stop-color:rgba(0,0,0,0.1)"/>
+    </linearGradient>
+
+    <!-- Drop shadow filter -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="20" flood-color="rgba(0,0,0,0.3)"/>
+    </filter>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect x="64" y="64" width="896" height="896" rx="180" ry="180"
+        fill="url(#bgGradient)" filter="url(#shadow)"/>
+
+  <!-- Inner highlight -->
+  <rect x="80" y="80" width="864" height="432" rx="170" ry="170"
+        fill="url(#innerShadow)" opacity="0.5"/>
+
+  <!-- Network nodes (decorative circles) -->
+  <circle cx="280" cy="280" r="40" fill="rgba(255,255,255,0.15)"/>
+  <circle cx="744" cy="280" r="30" fill="rgba(255,255,255,0.1)"/>
+  <circle cx="280" cy="744" r="25" fill="rgba(255,255,255,0.1)"/>
+  <circle cx="744" cy="744" r="35" fill="rgba(255,255,255,0.12)"/>
+
+  <!-- Connection lines (network-inspired) -->
+  <line x1="280" y1="280" x2="744" y2="280" stroke="rgba(255,255,255,0.08)" stroke-width="4"/>
+  <line x1="280" y1="280" x2="280" y2="744" stroke="rgba(255,255,255,0.08)" stroke-width="4"/>
+  <line x1="280" y1="280" x2="744" y2="744" stroke="rgba(255,255,255,0.06)" stroke-width="3"/>
+
+  <!-- Main "R" letter -->
+  <text x="512" y="620"
+        font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', sans-serif"
+        font-size="480"
+        font-weight="700"
+        fill="white"
+        text-anchor="middle"
+        opacity="0.95">R</text>
+
+  <!-- Small arrow/proxy indicator -->
+  <path d="M680 680 L760 600 L760 660 L820 660 L820 700 L760 700 L760 760 Z"
+        fill="rgba(255,255,255,0.8)"/>
+</svg>

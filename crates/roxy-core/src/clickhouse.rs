@@ -6,7 +6,6 @@
 use anyhow::{Context, Result};
 use clickhouse::{Client, Row};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Escape a string for safe use in ClickHouse SQL queries
 fn escape_string(s: &str) -> String {
