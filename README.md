@@ -556,6 +556,34 @@ cargo build --release
 ls -la target/release/roxy target/release/roxy-proxy
 ```
 
+### Building macOS App Bundle
+
+The project includes scripts for creating a proper macOS `.app` bundle with icon, code signing, and DMG creation:
+
+```bash
+# Generate app icons (one-time, requires librsvg: brew install librsvg)
+./script/generate-icon
+
+# Debug build - fast iteration, opens the app
+./script/bundle-mac -d -o
+
+# Release build - creates signed .app and .dmg
+./script/bundle-mac
+
+# Install to /Applications
+./script/bundle-mac -i
+
+# Build for specific architecture
+./script/bundle-mac aarch64-apple-darwin  # Apple Silicon
+./script/bundle-mac x86_64-apple-darwin   # Intel
+```
+
+For code signing and notarization (required for distribution), set these environment variables:
+- `MACOS_SIGNING_IDENTITY` - Your Developer ID certificate name
+- `MACOS_CERTIFICATE` - Base64-encoded .p12 certificate (for CI)
+- `MACOS_CERTIFICATE_PASSWORD` - Certificate password
+- `APPLE_NOTARIZATION_KEY`, `APPLE_NOTARIZATION_KEY_ID`, `APPLE_NOTARIZATION_ISSUER_ID` - For notarization
+
 ## Roadmap
 
 ### Backend (roxy-proxy)
@@ -585,6 +613,7 @@ ls -la target/release/roxy target/release/roxy-proxy
 - [x] Update notification banner
 - [x] Request row click to select and view details
 - [x] Host sidebar click to filter requests
+- [x] Set up proper Mac app with icon, "About Roxy", etc
 - [ ] Break out front end into proper reactive architecute with separate views, components, etc
 - [ ] Basic filtering (real time search)
 - [ ] Routing rules panel (create/edit/delete)

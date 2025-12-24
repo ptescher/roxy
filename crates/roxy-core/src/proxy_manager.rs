@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, watch, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Default proxy port
 pub const DEFAULT_PROXY_PORT: u16 = 8080;

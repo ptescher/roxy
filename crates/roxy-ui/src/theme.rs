@@ -7,7 +7,6 @@ use gpui::{rgb, rgba, Hsla};
 
 /// Catppuccin Mocha-inspired color palette
 pub mod colors {
-    use super::*;
 
     // Base colors
     pub const BASE: u32 = 0x1e1e2e;

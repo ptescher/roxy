@@ -10,18 +10,10 @@ use roxy_core::CURRENT_VERSION;
 use crate::theme::{colors, dimensions, font_size, spacing, Theme};
 
 /// Properties for the TitleBar component
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct TitleBarProps {
     /// Version available for update (if any)
     pub update_available: Option<String>,
-}
-
-impl Default for TitleBarProps {
-    fn default() -> Self {
-        Self {
-            update_available: None,
-        }
-    }
 }
 
 /// Title bar component

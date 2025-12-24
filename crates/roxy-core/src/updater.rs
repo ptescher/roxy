@@ -521,10 +521,10 @@ impl Updater {
             .unwrap_or("");
 
         if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
-            self.extract_tar_gz(download_path, &target_path.parent().unwrap())
+            self.extract_tar_gz(download_path, target_path.parent().unwrap())
                 .await?;
         } else if file_name.ends_with(".zip") {
-            self.extract_zip(download_path, &target_path.parent().unwrap())
+            self.extract_zip(download_path, target_path.parent().unwrap())
                 .await?;
         } else {
             // Direct binary copy
@@ -657,6 +657,7 @@ mod tests {
     #[test]
     fn test_current_version() {
         let v = Version::current();
-        assert!(v.major >= 0);
+        // Just verify it parses without panicking
+        let _ = v.major;
     }
 }

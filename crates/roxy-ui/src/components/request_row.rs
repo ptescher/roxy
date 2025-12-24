@@ -129,7 +129,7 @@ impl RequestRow {
 /// Format bytes to human-readable string
 pub fn format_bytes(bytes: i64) -> String {
     if bytes < 0 {
-        return "0 B".to_string();
+        "0 B".to_string()
     } else if bytes < 1024 {
         format!("{} B", bytes)
     } else if bytes < 1024 * 1024 {
