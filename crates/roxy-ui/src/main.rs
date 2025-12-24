@@ -14,12 +14,12 @@ use roxy_core::{ClickHouseConfig, RoxyClickHouse, CURRENT_VERSION};
 
 #[cfg(target_os = "macos")]
 use cocoa::{
-    appkit::{NSApp, NSImage},
+    appkit::NSImage,
     base::{id, nil},
     foundation::NSData,
 };
 #[cfg(target_os = "macos")]
-use objc::{msg_send, sel, sel_impl};
+use objc::{class, msg_send, sel, sel_impl};
 
 use roxy_proxy::{ProxyConfig, ProxyServer};
 use std::sync::atomic::Ordering;
@@ -489,8 +489,11 @@ impl Render for RoxyApp {
 
 /// Set the dock icon programmatically for development builds
 /// This is needed when running outside of an app bundle
+/// Must be called AFTER GPUI Application is initialized
 #[cfg(target_os = "macos")]
 fn set_dock_icon() {
+    use std::panic;
+
     // Try to load the icon from the resources directory
     let icon_paths = [
         // When running from project root
@@ -503,20 +506,40 @@ fn set_dock_icon() {
 
     for path in &icon_paths {
         if let Ok(data) = std::fs::read(path) {
-            unsafe {
+            // Use catch_unwind to handle any objc runtime issues gracefully
+            let result = panic::catch_unwind(|| unsafe {
                 let ns_data: id = NSData::dataWithBytes_length_(
                     nil,
                     data.as_ptr() as *const std::ffi::c_void,
                     data.len() as u64,
                 );
-                if ns_data != nil {
-                    let ns_image: id = NSImage::initWithData_(NSImage::alloc(nil), ns_data);
-                    if ns_image != nil {
-                        let app: id = NSApp();
-                        let _: () = msg_send![app, setApplicationIconImage: ns_image];
-                        tracing::debug!("Set dock icon from: {}", path);
-                        return;
-                    }
+                if ns_data == nil {
+                    return false;
+                }
+                let ns_image: id = NSImage::initWithData_(NSImage::alloc(nil), ns_data);
+                if ns_image == nil {
+                    return false;
+                }
+                // Use sharedApplication instead of NSApp() for better compatibility
+                let app: id = msg_send![class!(NSApplication), sharedApplication];
+                if app == nil {
+                    return false;
+                }
+                let _: () = msg_send![app, setApplicationIconImage: ns_image];
+                true
+            });
+
+            match result {
+                Ok(true) => {
+                    tracing::debug!("Set dock icon from: {}", path);
+                    return;
+                }
+                Ok(false) => continue,
+                Err(_) => {
+                    tracing::debug!(
+                        "Failed to set dock icon (objc error), continuing without icon"
+                    );
+                    return;
                 }
             }
         }
@@ -544,10 +567,11 @@ fn main() {
 
     tracing::info!("Starting Roxy UI v{}", CURRENT_VERSION);
 
-    // Set the dock icon for development builds (when not running as .app bundle)
-    set_dock_icon();
-
     Application::new().run(|cx: &mut App| {
+        // Set the dock icon for development builds (when not running as .app bundle)
+        // Must be called after GPUI initializes NSApplication
+        set_dock_icon();
+
         // Set up the macOS menu bar
         cx.set_menus(vec![
             Menu {
