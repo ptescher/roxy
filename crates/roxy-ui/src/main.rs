@@ -9,7 +9,7 @@ mod state;
 mod theme;
 
 use gpui::prelude::*;
-use gpui::*;
+use gpui::{KeyBinding, *};
 use roxy_core::{ClickHouseConfig, RoxyClickHouse, CURRENT_VERSION};
 
 #[cfg(target_os = "macos")]
@@ -35,7 +35,19 @@ use state::{AppState, ProxyStatus, UiMessage};
 use theme::{colors, dimensions};
 
 // Define actions for the menu bar
-actions!(roxy, [Quit, About, ClearRequests, ToggleProxy, ShowHelp]);
+actions!(
+    roxy,
+    [
+        Quit,
+        About,
+        ClearRequests,
+        ToggleProxy,
+        ShowHelp,
+        Minimize,
+        Zoom,
+        CloseWindow
+    ]
+);
 
 /// Main application view
 struct RoxyApp {
@@ -572,6 +584,20 @@ fn main() {
         // Must be called after GPUI initializes NSApplication
         set_dock_icon();
 
+        // Bind keyboard shortcuts
+        cx.bind_keys([
+            // Application menu
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-,", About, None), // Preferences (shows About for now)
+            // File menu
+            KeyBinding::new("cmd-k", ClearRequests, None),
+            // Window
+            KeyBinding::new("cmd-w", CloseWindow, None),
+            KeyBinding::new("cmd-m", Minimize, None),
+            // Help
+            KeyBinding::new("cmd-shift-/", ShowHelp, None),
+        ]);
+
         // Set up the macOS menu bar
         cx.set_menus(vec![
             Menu {
@@ -579,20 +605,29 @@ fn main() {
                 items: vec![
                     MenuItem::action("About Roxy", About),
                     MenuItem::separator(),
-                    MenuItem::action("Quit Roxy", Quit),
+                    MenuItem::action("Quit Roxy", Quit), // cmd-q
                 ],
             },
             Menu {
                 name: "File".into(),
                 items: vec![
-                    MenuItem::action("Clear Requests", ClearRequests),
+                    MenuItem::action("Clear Requests", ClearRequests), // cmd-k
                     MenuItem::separator(),
                     MenuItem::action("Toggle Proxy", ToggleProxy),
                 ],
             },
             Menu {
+                name: "Window".into(),
+                items: vec![
+                    MenuItem::action("Minimize", Minimize),
+                    MenuItem::action("Zoom", Zoom),
+                    MenuItem::separator(),
+                    MenuItem::action("Close Window", CloseWindow),
+                ],
+            },
+            Menu {
                 name: "Help".into(),
-                items: vec![MenuItem::action("Roxy Help", ShowHelp)],
+                items: vec![MenuItem::action("Roxy Help", ShowHelp)], // cmd-?
             },
         ]);
 
@@ -615,6 +650,21 @@ fn main() {
 
         cx.on_action(|_: &ShowHelp, _cx| {
             tracing::info!("Show help action triggered");
+        });
+
+        cx.on_action(|_: &Minimize, _cx| {
+            tracing::info!("Minimize action triggered");
+            // GPUI handles window minimize automatically through the menu
+        });
+
+        cx.on_action(|_: &Zoom, _cx| {
+            tracing::info!("Zoom action triggered");
+            // GPUI handles window zoom automatically through the menu
+        });
+
+        cx.on_action(|_: &CloseWindow, cx| {
+            // For a single-window app, closing the window quits
+            cx.quit();
         });
 
         // Configure window options
