@@ -1,129 +1,148 @@
 //! Kubernetes Panel Component for Roxy UI
 //!
-//! This component renders a visual overview of Kubernetes resources:
-//! - Active port forwards from Roxy to K8s services
-//! - HTTPRoute resources showing external traffic routing
-//!
-//! The visualization is a graph flowing left to right, similar to a mermaid diagram.
+//! This component renders a visual graph of Kubernetes traffic flow using a custom
+//! node graph element with bezier curve edges connecting the nodes.
 
 use gpui::prelude::*;
 use gpui::*;
+use std::collections::HashSet;
 
-use crate::theme::{colors, dimensions, font_size, spacing, Theme};
+use crate::components::node_graph::{
+    EdgeStyle, GraphEdge, GraphLayout, GraphNode, NodeGraph, NodeGraphBuilder,
+    NodeId as GraphNodeId,
+};
+use crate::theme::{colors, font_size, spacing, Theme};
 
-/// Represents a node in the Kubernetes graph
-#[derive(Debug, Clone, PartialEq)]
-pub enum NodeType {
-    /// External traffic source (Internet)
-    Internet,
-    /// Roxy proxy
-    Roxy,
-    /// A Kubernetes Gateway
-    Gateway { name: String },
-    /// A Kubernetes Service
-    Service { name: String, namespace: String },
-    /// A Kubernetes Pod
-    Pod { name: String, namespace: String },
-    /// External service (database, etc.)
-    External { name: String },
-}
+// =============================================================================
+// Data Types
+// =============================================================================
 
-impl NodeType {
-    pub fn label(&self) -> String {
-        match self {
-            NodeType::Internet => "Internet".to_string(),
-            NodeType::Roxy => "Roxy".to_string(),
-            NodeType::Gateway { name } => format!("Gateway\n{}", name),
-            NodeType::Service { name, namespace } => format!("{}\n{}", name, namespace),
-            NodeType::Pod { name, .. } => name.clone(),
-            NodeType::External { name } => name.clone(),
-        }
-    }
-
-    pub fn short_label(&self) -> String {
-        match self {
-            NodeType::Internet => "Internet".to_string(),
-            NodeType::Roxy => "Roxy".to_string(),
-            NodeType::Gateway { name } => name.clone(),
-            NodeType::Service { name, .. } => name.clone(),
-            NodeType::Pod { name, .. } => name.clone(),
-            NodeType::External { name } => name.clone(),
-        }
-    }
-}
-
-/// Represents an edge/connection in the graph
+/// Kubernetes Ingress resource
 #[derive(Debug, Clone)]
-pub struct GraphEdge {
-    /// Source node index
-    pub from: usize,
-    /// Target node index
-    pub to: usize,
-    /// Label for the edge (e.g., port number, path)
-    pub label: Option<String>,
-    /// Whether this connection is active
-    pub active: bool,
-}
-
-/// Represents a port forward from Roxy
-#[derive(Debug, Clone)]
-pub struct PortForwardInfo {
-    /// The K8s service DNS name
-    pub service_dns: String,
-    /// The namespace
-    pub namespace: String,
-    /// The service name
-    pub service_name: String,
-    /// Remote port
-    pub remote_port: u16,
-    /// Local port
-    pub local_port: u16,
-    /// Whether currently active
-    pub active: bool,
-}
-
-/// Represents an HTTPRoute resource
-#[derive(Debug, Clone)]
-pub struct HttpRouteInfo {
-    /// Route name
+pub struct K8sIngress {
     pub name: String,
-    /// Namespace
     pub namespace: String,
-    /// Hostnames this route matches
+    pub hosts: Vec<String>,
+    pub ingress_class: Option<String>,
+}
+
+/// Kubernetes Gateway resource (Gateway API)
+#[derive(Debug, Clone)]
+pub struct K8sGateway {
+    pub name: String,
+    pub namespace: String,
+    pub gateway_class: Option<String>,
+    pub listeners: Vec<K8sGatewayListener>,
+}
+
+/// Gateway listener configuration
+#[derive(Debug, Clone)]
+pub struct K8sGatewayListener {
+    pub name: String,
+    pub hostname: Option<String>,
+    pub port: u16,
+    pub protocol: String,
+}
+
+/// Parent reference in an HTTPRoute (points to a Gateway)
+#[derive(Debug, Clone)]
+pub struct K8sParentRef {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub section_name: Option<String>,
+}
+
+/// Kubernetes HTTPRoute resource (Gateway API)
+#[derive(Debug, Clone)]
+pub struct K8sHttpRoute {
+    pub name: String,
+    pub namespace: String,
     pub hostnames: Vec<String>,
-    /// Path matches
     pub paths: Vec<String>,
-    /// Backend service references
-    pub backends: Vec<BackendRef>,
+    pub parent_refs: Vec<K8sParentRef>,
+    pub backend_refs: Vec<K8sBackendRef>,
 }
 
 /// Backend reference in an HTTPRoute
 #[derive(Debug, Clone)]
-pub struct BackendRef {
-    /// Service name
-    pub name: String,
-    /// Service namespace (if different from route)
-    pub namespace: Option<String>,
-    /// Port
+pub struct K8sBackendRef {
+    pub service_name: String,
+    pub namespace: String,
     pub port: u16,
-    /// Weight for traffic splitting
+    pub weight: Option<u32>,
+}
+
+/// Kubernetes Service
+#[derive(Debug, Clone)]
+pub struct K8sService {
+    pub name: String,
+    pub namespace: String,
+    pub service_type: String,
+    pub ports: Vec<K8sServicePort>,
+    pub ready_endpoints: u32,
+    pub total_endpoints: u32,
+}
+
+/// Service port definition
+#[derive(Debug, Clone)]
+pub struct K8sServicePort {
+    pub name: Option<String>,
+    pub port: u16,
+    pub target_port: u16,
+    pub protocol: String,
+}
+
+/// Port forward from Roxy to a K8s service
+#[derive(Debug, Clone)]
+pub struct PortForwardInfo {
+    pub service_dns: String,
+    pub namespace: String,
+    pub service_name: String,
+    pub remote_port: u16,
+    pub local_port: u16,
+    pub active: bool,
+}
+
+/// HTTPRoute info (legacy - kept for compatibility)
+#[derive(Debug, Clone)]
+pub struct HttpRouteInfo {
+    pub name: String,
+    pub namespace: String,
+    pub hostnames: Vec<String>,
+    pub paths: Vec<String>,
+    pub backends: Vec<BackendRef>,
+}
+
+/// Backend reference (legacy)
+#[derive(Debug, Clone)]
+pub struct BackendRef {
+    pub name: String,
+    pub namespace: Option<String>,
+    pub port: u16,
     pub weight: u32,
 }
+
+// =============================================================================
+// Panel Props
+// =============================================================================
 
 /// Properties for the Kubernetes Panel
 #[derive(Clone, Default)]
 pub struct KubernetesPanelProps {
-    /// Active port forwards
+    pub gateways: Vec<K8sGateway>,
+    pub ingresses: Vec<K8sIngress>,
+    pub http_routes: Vec<K8sHttpRoute>,
+    pub services: Vec<K8sService>,
     pub port_forwards: Vec<PortForwardInfo>,
-    /// HTTPRoute resources
-    pub http_routes: Vec<HttpRouteInfo>,
-    /// Panel width
+    pub selected_namespace: Option<String>,
     pub width: f32,
-    /// Panel height
     pub height: f32,
-    /// Scroll handle
     pub scroll_handle: ScrollHandle,
 }
+
+// =============================================================================
+// Panel Component
+// =============================================================================
 
 /// Kubernetes Panel component
 pub struct KubernetesPanel {
@@ -140,17 +159,33 @@ impl KubernetesPanel {
     }
 
     pub fn render(&self) -> impl IntoElement {
+        let scroll_handle = self.props.scroll_handle.clone();
+
         div()
             .flex()
             .flex_col()
-            .w(px(self.props.width))
-            .h(px(self.props.height))
+            .size_full()
             .bg(rgb(colors::BASE))
             .child(self.render_header())
-            .child(self.render_content())
+            .child(
+                div()
+                    .id("k8s-flow-content")
+                    .flex_1()
+                    .overflow_scroll()
+                    .track_scroll(&scroll_handle)
+                    .p(spacing::LG)
+                    .child(self.render_flow_diagram()),
+            )
     }
 
     fn render_header(&self) -> impl IntoElement {
+        let ns_label = self
+            .props
+            .selected_namespace
+            .as_ref()
+            .map(|ns| format!("Namespace: {}", ns))
+            .unwrap_or_else(|| "All Namespaces".to_string());
+
         div()
             .flex()
             .items_center()
@@ -160,29 +195,62 @@ impl KubernetesPanel {
             .border_b_1()
             .border_color(rgb(colors::SURFACE_0))
             .child(
-                div().flex().items_center().gap(spacing::SM).child(
-                    div()
-                        .text_size(font_size::LG)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(self.theme.text_primary)
-                        .child("Kubernetes Overview"),
-                ),
-            )
-            .child(
                 div()
                     .flex()
+                    .items_center()
                     .gap(spacing::SM)
-                    .child(self.render_legend_item("Port Forward", colors::TEAL))
-                    .child(self.render_legend_item("HTTPRoute", colors::MAUVE)),
+                    .child(
+                        div()
+                            .text_size(font_size::LG)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(self.theme.text_primary)
+                            .child("Traffic Flow"),
+                    )
+                    .child(
+                        div()
+                            .px(spacing::XS)
+                            .py(spacing::XXS)
+                            .rounded(px(4.0))
+                            .bg(rgb(colors::SURFACE_0))
+                            .text_size(font_size::SM)
+                            .text_color(self.theme.text_secondary)
+                            .child(ns_label),
+                    ),
             )
+            .child(self.render_legend())
     }
 
-    fn render_legend_item(&self, label: &str, color: u32) -> impl IntoElement {
+    fn render_legend(&self) -> impl IntoElement {
         div()
             .flex()
             .items_center()
-            .gap(spacing::XXS)
-            .child(div().size(px(8.0)).rounded(px(2.0)).bg(rgb(color)))
+            .gap(spacing::MD)
+            .child(self.render_legend_item("Traffic", colors::SAPPHIRE, false))
+            .child(self.render_legend_item("Port Forward", colors::TEAL, true))
+    }
+
+    fn render_legend_item(&self, label: &str, color: u32, is_dotted: bool) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(spacing::XS)
+            .child(if is_dotted {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(div().w(px(4.0)).h(px(2.0)).bg(rgb(color)))
+                    .child(div().w(px(4.0)).h(px(2.0)).bg(rgb(color)))
+                    .child(div().w(px(4.0)).h(px(2.0)).bg(rgb(color)))
+                    .into_any_element()
+            } else {
+                div()
+                    .w(px(20.0))
+                    .h(px(2.0))
+                    .rounded(px(1.0))
+                    .bg(rgb(color))
+                    .into_any_element()
+            })
             .child(
                 div()
                     .text_size(font_size::XS)
@@ -191,276 +259,358 @@ impl KubernetesPanel {
             )
     }
 
-    fn render_content(&self) -> impl IntoElement {
-        let scroll_handle = self.props.scroll_handle.clone();
+    fn render_flow_diagram(&self) -> impl IntoElement {
+        let has_ingresses = !self.props.ingresses.is_empty();
+        let has_routes = !self.props.http_routes.is_empty();
+        let has_services = !self.props.services.is_empty();
+        let has_port_forwards = !self.props.port_forwards.is_empty();
+        let has_data = has_ingresses || has_routes || has_services || has_port_forwards;
 
-        div()
-            .id("k8s-content")
-            .flex_1()
-            .overflow_scroll()
-            .track_scroll(&scroll_handle)
-            .p(spacing::MD)
-            .child(self.render_graph())
+        if !has_data {
+            return self.render_empty_state().into_any_element();
+        }
+
+        // Build the node graph
+        let graph = self.build_graph();
+
+        // Render using the node graph component
+        crate::components::node_graph::node_graph(graph).into_any_element()
     }
 
-    fn render_graph(&self) -> impl IntoElement {
-        // Build the graph layout
-        let mut columns: Vec<Vec<GraphNode>> = vec![vec![], vec![], vec![]];
+    /// Build the node graph from Kubernetes resources
+    ///
+    /// Layout columns:
+    /// - Column 0: Sources (Internet, Roxy)
+    /// - Column 1: Gateways (Gateway API) or Ingresses (legacy)
+    /// - Column 2: HTTPRoutes
+    /// - Column 3: Services
+    fn build_graph(&self) -> NodeGraph {
+        let layout = GraphLayout {
+            node_width: 180.0,
+            node_height: 64.0,
+            column_spacing: 100.0,
+            row_spacing: 16.0,
+            padding: 24.0,
+        };
 
-        // Column 0: Sources (Internet, Roxy)
-        if !self.props.http_routes.is_empty() {
-            columns[0].push(GraphNode {
-                node_type: NodeType::Internet,
-                color: colors::SAPPHIRE,
-            });
+        let mut builder = NodeGraphBuilder::with_layout(layout);
+        let mut added_services: HashSet<String> = HashSet::new();
+        let mut added_gateways: HashSet<String> = HashSet::new();
+
+        // Determine layout mode based on what data we have
+        let has_gateways = !self.props.gateways.is_empty();
+        let has_ingresses = !self.props.ingresses.is_empty();
+        let has_routes = !self.props.http_routes.is_empty();
+        let has_port_forwards = !self.props.port_forwards.is_empty();
+        let has_routing = has_gateways || has_ingresses || has_routes;
+
+        // Column layout:
+        // - With routing: Internet(0) -> Gateway/Ingress(1) -> HTTPRoute(2) -> Service(3)
+        // - Without routing: Internet(0) -> Service(1)
+        let service_column = if has_routing { 3 } else { 1 };
+        let mut row_counters: [usize; 5] = [0, 0, 0, 0, 0];
+
+        // Column 0: Add Internet node only if we have gateways or ingresses (actual entry points)
+        if has_gateways || has_ingresses {
+            builder = builder.node(
+                GraphNode::new(GraphNodeId::Internet, "Internet", "🌐", colors::SAPPHIRE)
+                    .with_sublabel("External Traffic")
+                    .at(0, row_counters[0]),
+            );
+            row_counters[0] += 1;
         }
 
-        if !self.props.port_forwards.is_empty() {
-            columns[0].push(GraphNode {
-                node_type: NodeType::Roxy,
-                color: colors::TEAL,
-            });
+        // Column 0: Add Roxy node if we have port forwards (always one row below Internet with a gap)
+        if has_port_forwards {
+            // Skip a row to create visual gap between Internet and Roxy
+            row_counters[0] += 1;
+
+            builder = builder.node(
+                GraphNode::new(GraphNodeId::Roxy, "Roxy", "🦊", colors::TEAL)
+                    .with_sublabel("Port Forwards")
+                    .at(0, row_counters[0]),
+            );
+
+            // Add dashed edge from Internet to Roxy (always exists when both are present)
+            if has_gateways || has_ingresses {
+                builder = builder.edge(
+                    GraphEdge::new(GraphNodeId::Internet, GraphNodeId::Roxy)
+                        .with_style(EdgeStyle::dashed(colors::TEAL)),
+                );
+            }
+
+            row_counters[0] += 1;
         }
 
-        // Column 1: Gateways (for HTTPRoutes) - we can skip this for simplicity
-        // Column 2: Services
-
-        // Add port forward targets
-        for pf in &self.props.port_forwards {
-            columns[2].push(GraphNode {
-                node_type: NodeType::Service {
-                    name: pf.service_name.clone(),
-                    namespace: pf.namespace.clone(),
-                },
-                color: colors::TEAL,
-            });
-        }
-
-        // Add HTTPRoute backends
-        for route in &self.props.http_routes {
-            for backend in &route.backends {
-                let namespace = backend
-                    .namespace
-                    .clone()
-                    .unwrap_or_else(|| route.namespace.clone());
-
-                // Check if already added
-                let exists = columns[2].iter().any(|n| {
-                    matches!(&n.node_type, NodeType::Service { name, namespace: ns }
-                        if name == &backend.name && ns == &namespace)
-                });
-
-                if !exists {
-                    columns[2].push(GraphNode {
-                        node_type: NodeType::Service {
-                            name: backend.name.clone(),
-                            namespace,
-                        },
-                        color: colors::MAUVE,
-                    });
+        // Column 1: Gateways (Gateway API)
+        for gateway in &self.props.gateways {
+            if let Some(ref ns) = self.props.selected_namespace {
+                if &gateway.namespace != ns {
+                    continue;
                 }
+            }
+
+            let gateway_id = GraphNodeId::Gateway(gateway.namespace.clone(), gateway.name.clone());
+            let gateway_key = gateway_id.key();
+
+            // Build sublabel from listeners
+            let sublabel = gateway
+                .listeners
+                .first()
+                .map(|l| l.hostname.clone().unwrap_or_else(|| format!(":{}", l.port)))
+                .unwrap_or_else(|| "*".to_string());
+
+            builder = builder.node(
+                GraphNode::new(
+                    gateway_id.clone(),
+                    gateway.name.clone(),
+                    "🌉",
+                    colors::MAUVE,
+                )
+                .with_sublabel(sublabel)
+                .in_namespace(gateway.namespace.clone())
+                .at(1, row_counters[1]),
+            );
+            added_gateways.insert(gateway_key);
+
+            // Edge from Internet to Gateway
+            builder = builder.edge(
+                GraphEdge::new(GraphNodeId::Internet, gateway_id)
+                    .with_style(EdgeStyle::solid(colors::SAPPHIRE)),
+            );
+
+            row_counters[1] += 1;
+        }
+
+        // Column 1: Ingresses (legacy - only if no gateways)
+        if !has_gateways {
+            for ingress in &self.props.ingresses {
+                if let Some(ref ns) = self.props.selected_namespace {
+                    if &ingress.namespace != ns {
+                        continue;
+                    }
+                }
+
+                let host = ingress
+                    .hosts
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "*".to_string());
+
+                builder = builder.node(
+                    GraphNode::new(
+                        GraphNodeId::Ingress(ingress.name.clone()),
+                        ingress.name.clone(),
+                        "🚪",
+                        colors::MAUVE,
+                    )
+                    .with_sublabel(host)
+                    .in_namespace(ingress.namespace.clone())
+                    .at(1, row_counters[1]),
+                );
+
+                // Edge from Internet to Ingress
+                builder = builder.edge(
+                    GraphEdge::new(
+                        GraphNodeId::Internet,
+                        GraphNodeId::Ingress(ingress.name.clone()),
+                    )
+                    .with_style(EdgeStyle::solid(colors::SAPPHIRE)),
+                );
+
+                row_counters[1] += 1;
             }
         }
 
-        // Render the graph
-        div()
-            .flex()
-            .gap(px(80.0))
-            .items_start()
-            .children(
-                columns
-                    .iter()
-                    .enumerate()
-                    .map(|(col_idx, nodes)| self.render_column(col_idx, nodes)),
-            )
-            .child(self.render_connections())
+        // Column 2: HTTPRoutes
+        for route in &self.props.http_routes {
+            if let Some(ref ns) = self.props.selected_namespace {
+                if &route.namespace != ns {
+                    continue;
+                }
+            }
+
+            let path = route
+                .paths
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "/*".to_string());
+
+            let route_id = GraphNodeId::Route(route.namespace.clone(), route.name.clone());
+
+            builder = builder.node(
+                GraphNode::new(route_id.clone(), route.name.clone(), "🔀", colors::LAVENDER)
+                    .with_sublabel(path)
+                    .in_namespace(route.namespace.clone())
+                    .at(2, row_counters[2]),
+            );
+
+            // Connect HTTPRoute to its parent Gateway(s) via parentRefs
+            let mut connected_to_parent = false;
+            for parent_ref in &route.parent_refs {
+                let parent_ns = parent_ref
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| route.namespace.clone());
+                let gateway_id = GraphNodeId::Gateway(parent_ns, parent_ref.name.clone());
+                let gateway_key = gateway_id.key();
+
+                if added_gateways.contains(&gateway_key) {
+                    builder = builder.edge(
+                        GraphEdge::new(gateway_id, route_id.clone())
+                            .with_style(EdgeStyle::solid(colors::SAPPHIRE)),
+                    );
+                    connected_to_parent = true;
+                }
+            }
+
+            // Fallback: connect to Ingress or Internet if no gateway parent found
+            if !connected_to_parent {
+                if let Some(ingress) = self.props.ingresses.first() {
+                    builder = builder.edge(
+                        GraphEdge::new(
+                            GraphNodeId::Ingress(ingress.name.clone()),
+                            route_id.clone(),
+                        )
+                        .with_style(EdgeStyle::solid(colors::SAPPHIRE)),
+                    );
+                } else if has_gateways {
+                    // Connect to first gateway as fallback
+                    if let Some(gateway) = self.props.gateways.first() {
+                        builder = builder.edge(
+                            GraphEdge::new(
+                                GraphNodeId::Gateway(
+                                    gateway.namespace.clone(),
+                                    gateway.name.clone(),
+                                ),
+                                route_id.clone(),
+                            )
+                            .with_style(EdgeStyle::solid(colors::SAPPHIRE)),
+                        );
+                    }
+                } else {
+                    builder = builder.edge(
+                        GraphEdge::new(GraphNodeId::Internet, route_id.clone())
+                            .with_style(EdgeStyle::solid(colors::SAPPHIRE)),
+                    );
+                }
+            }
+
+            // Edges from Route to Services (backendRefs)
+            for backend in &route.backend_refs {
+                let svc_id =
+                    GraphNodeId::Service(backend.namespace.clone(), backend.service_name.clone());
+                builder = builder.edge(
+                    GraphEdge::new(route_id.clone(), svc_id)
+                        .with_label(format!(":{}", backend.port))
+                        .with_style(EdgeStyle::solid(colors::SAPPHIRE)),
+                );
+            }
+
+            row_counters[2] += 1;
+        }
+
+        // Column 3 (or 1): Services
+        for service in &self.props.services {
+            if let Some(ref ns) = self.props.selected_namespace {
+                if &service.namespace != ns {
+                    continue;
+                }
+            }
+
+            let svc_id = GraphNodeId::Service(service.namespace.clone(), service.name.clone());
+            let port_str = service
+                .ports
+                .first()
+                .map(|p| format!(":{}", p.port))
+                .unwrap_or_default();
+
+            let svc_key = svc_id.key();
+            builder = builder.node(
+                GraphNode::new(svc_id.clone(), service.name.clone(), "📦", colors::GREEN)
+                    .with_sublabel(format!("{}{}", service.namespace, port_str))
+                    .with_status(service.ready_endpoints, service.total_endpoints)
+                    .in_namespace(service.namespace.clone())
+                    .at(service_column, row_counters[service_column]),
+            );
+            added_services.insert(svc_key.clone());
+
+            // Services are only connected via Gateway -> HTTPRoute -> Service flow
+            // No direct Internet -> Service connections
+            // (Port forwards from Roxy are added separately below)
+
+            row_counters[service_column] += 1;
+        }
+
+        // Add port forward edges (from Roxy to Services)
+        for pf in &self.props.port_forwards {
+            if let Some(ref ns) = self.props.selected_namespace {
+                if &pf.namespace != ns {
+                    continue;
+                }
+            }
+
+            let svc_id = GraphNodeId::Service(pf.namespace.clone(), pf.service_name.clone());
+            let svc_key = svc_id.key();
+
+            // Ensure service node exists
+            if !added_services.contains(&svc_key) {
+                builder = builder.node(
+                    GraphNode::new(svc_id.clone(), pf.service_name.clone(), "📦", colors::TEAL)
+                        .with_sublabel(format!("{}:{}", pf.namespace, pf.remote_port))
+                        .in_namespace(pf.namespace.clone())
+                        .at(service_column, row_counters[service_column]),
+                );
+                added_services.insert(svc_key);
+                row_counters[service_column] += 1;
+            }
+
+            builder = builder.edge(
+                GraphEdge::new(GraphNodeId::Roxy, svc_id)
+                    .with_label(format!(":{} → :{}", pf.local_port, pf.remote_port))
+                    .with_style(EdgeStyle::dashed(colors::TEAL)),
+            );
+        }
+
+        builder.build()
     }
 
-    fn render_column(&self, _col_idx: usize, nodes: &[GraphNode]) -> impl IntoElement {
+    fn render_empty_state(&self) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
-            .gap(spacing::LG)
-            .children(nodes.iter().map(|node| self.render_node(node)))
-    }
-
-    fn render_node(&self, node: &GraphNode) -> impl IntoElement {
-        let (icon, label, sublabel) = match &node.node_type {
-            NodeType::Internet => ("🌐", "Internet".to_string(), None),
-            NodeType::Roxy => ("🦊", "Roxy".to_string(), Some("SOCKS5 :1080".to_string())),
-            NodeType::Gateway { name } => ("🚪", name.clone(), Some("Gateway".to_string())),
-            NodeType::Service { name, namespace } => ("📦", name.clone(), Some(namespace.clone())),
-            NodeType::Pod { name, namespace } => ("🔷", name.clone(), Some(namespace.clone())),
-            NodeType::External { name } => ("🔗", name.clone(), None),
-        };
-
-        div()
-            .flex()
             .items_center()
-            .gap(spacing::SM)
-            .px(spacing::MD)
-            .py(spacing::SM)
-            .min_w(px(150.0))
-            .bg(rgb(colors::SURFACE_0))
-            .border_1()
-            .border_color(rgb(node.color))
-            .rounded(dimensions::BORDER_RADIUS)
-            .child(div().text_size(font_size::XL).child(icon.to_string()))
+            .justify_center()
+            .h(px(300.0))
+            .gap(spacing::MD)
+            .child(div().text_size(px(48.0)).child("☸"))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(font_size::MD)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(self.theme.text_primary)
-                            .child(label),
-                    )
-                    .when_some(sublabel, |this, sub| {
-                        this.child(
-                            div()
-                                .text_size(font_size::XS)
-                                .text_color(self.theme.text_muted)
-                                .child(sub),
-                        )
-                    }),
-            )
-    }
-
-    fn render_connections(&self) -> impl IntoElement {
-        // Render connection lines as a separate layer
-        // In GPUI, we'll represent connections as text labels between nodes
-        // A full SVG-based graph would require more complex rendering
-
-        div().absolute().top_0().left_0().w_full().h_full().child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(spacing::XS)
-                .p(spacing::SM)
-                .children(self.props.port_forwards.iter().map(|pf| {
-                    self.render_connection_label(
-                        "Roxy",
-                        &format!("{}.{}", pf.service_name, pf.namespace),
-                        &format!(":{} → :{}", pf.local_port, pf.remote_port),
-                        colors::TEAL,
-                        pf.active,
-                    )
-                }))
-                .children(self.props.http_routes.iter().flat_map(|route| {
-                    route.backends.iter().map(|backend| {
-                        let ns = backend
-                            .namespace
-                            .clone()
-                            .unwrap_or_else(|| route.namespace.clone());
-                        let paths = route.paths.join(", ");
-                        self.render_connection_label(
-                            &route.hostnames.join(", "),
-                            &format!("{}.{}", backend.name, ns),
-                            &format!("{} → :{}", paths, backend.port),
-                            colors::MAUVE,
-                            true,
-                        )
-                    })
-                })),
-        )
-    }
-
-    fn render_connection_label(
-        &self,
-        from: &str,
-        to: &str,
-        label: &str,
-        color: u32,
-        active: bool,
-    ) -> impl IntoElement {
-        let opacity = if active { 1.0 } else { 0.5 };
-
-        div()
-            .flex()
-            .items_center()
-            .gap(spacing::SM)
-            .opacity(opacity)
-            .child(
-                div()
-                    .text_size(font_size::SM)
-                    .text_color(self.theme.text_secondary)
-                    .child(from.to_string()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(spacing::XXS)
-                    .child(div().w(px(40.0)).h(px(2.0)).bg(rgb(color)))
-                    .child(
-                        div()
-                            .text_size(font_size::XS)
-                            .text_color(rgb(color))
-                            .child(label.to_string()),
-                    )
-                    .child(div().w(px(20.0)).h(px(2.0)).bg(rgb(color)))
-                    .child(
-                        div()
-                            .text_size(font_size::MD)
-                            .text_color(rgb(color))
-                            .child("→"),
-                    ),
+                    .text_size(font_size::LG)
+                    .text_color(self.theme.text_muted)
+                    .child("No Kubernetes resources found"),
             )
             .child(
                 div()
                     .text_size(font_size::SM)
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(self.theme.text_primary)
-                    .child(to.to_string()),
+                    .text_color(self.theme.text_muted)
+                    .max_w(px(400.0))
+                    .text_center()
+                    .child("Select a namespace to view the traffic flow graph."),
             )
     }
 }
 
-/// Internal graph node representation
-#[derive(Clone)]
-struct GraphNode {
-    node_type: NodeType,
-    color: u32,
-}
+// =============================================================================
+// Convenience Functions
+// =============================================================================
 
-/// Convenience function to render the Kubernetes panel
+/// Convenience function to render a kubernetes panel
 pub fn kubernetes_panel(props: KubernetesPanelProps) -> impl IntoElement {
     KubernetesPanel::new(props).render()
 }
 
-/// Section component for grouping related items
-pub struct KubernetesSection {
-    title: String,
-    theme: Theme,
-}
-
-impl KubernetesSection {
-    pub fn new(title: impl Into<String>) -> Self {
-        Self {
-            title: title.into(),
-            theme: Theme::dark(),
-        }
-    }
-
-    pub fn render(&self, children: impl IntoElement) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap(spacing::SM)
-            .child(
-                div()
-                    .text_size(font_size::SM)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(self.theme.text_muted)
-                    .child(self.title.clone()),
-            )
-            .child(children)
-    }
-}
-
-/// Port forwards list component
+/// Port forwards list component (legacy)
 pub fn port_forwards_list(forwards: &[PortForwardInfo]) -> impl IntoElement {
     let theme = Theme::dark();
 
@@ -487,11 +637,10 @@ pub fn port_forwards_list(forwards: &[PortForwardInfo]) -> impl IntoElement {
             div()
                 .flex()
                 .items_center()
-                .justify_between()
                 .px(spacing::SM)
                 .py(spacing::XS)
                 .bg(rgb(colors::SURFACE_0))
-                .rounded(dimensions::BORDER_RADIUS)
+                .rounded(px(4.0))
                 .child(
                     div()
                         .flex()
@@ -524,7 +673,7 @@ pub fn port_forwards_list(forwards: &[PortForwardInfo]) -> impl IntoElement {
         .into_any_element()
 }
 
-/// HTTP routes list component
+/// HTTP routes list component (legacy)
 pub fn http_routes_list(routes: &[HttpRouteInfo]) -> impl IntoElement {
     let theme = Theme::dark();
 
@@ -548,7 +697,7 @@ pub fn http_routes_list(routes: &[HttpRouteInfo]) -> impl IntoElement {
                 .gap(spacing::XXS)
                 .p(spacing::SM)
                 .bg(rgb(colors::SURFACE_0))
-                .rounded(dimensions::BORDER_RADIUS)
+                .rounded(px(4.0))
                 .child(
                     div()
                         .flex()
@@ -574,197 +723,11 @@ pub fn http_routes_list(routes: &[HttpRouteInfo]) -> impl IntoElement {
                         .text_color(rgb(colors::SAPPHIRE))
                         .child(route.hostnames.join(", ")),
                 )
-                .child(div().flex().flex_col().gap(spacing::XXXS).children(
-                    route.backends.iter().map(|backend| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(spacing::XS)
-                            .child(
-                                div()
-                                    .text_size(font_size::XS)
-                                    .text_color(theme.text_muted)
-                                    .child("→"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(font_size::XS)
-                                    .text_color(theme.text_secondary)
-                                    .child(format!("{}:{}", backend.name, backend.port)),
-                            )
-                    }),
-                ))
         }))
         .into_any_element()
 }
 
-/// Flow diagram component - renders a left-to-right flow
+/// Flow diagram component (legacy)
 pub fn flow_diagram(props: &KubernetesPanelProps) -> impl IntoElement {
-    let theme = Theme::dark();
-
-    div()
-        .flex()
-        .flex_col()
-        .gap(spacing::LG)
-        // Port forwards section
-        .when(!props.port_forwards.is_empty(), |this| {
-            this.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(spacing::SM)
-                    .child(
-                        div()
-                            .text_size(font_size::SM)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_muted)
-                            .child("PORT FORWARDS"),
-                    )
-                    .children(props.port_forwards.iter().map(|pf| {
-                        render_flow_row(
-                            "🦊 Roxy",
-                            &format!("📦 {}", pf.service_dns),
-                            &format!("SOCKS5 :{} → :{}", pf.local_port, pf.remote_port),
-                            colors::TEAL,
-                            pf.active,
-                        )
-                    })),
-            )
-        })
-        // HTTP routes section
-        .when(!props.http_routes.is_empty(), |this| {
-            this.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(spacing::SM)
-                    .child(
-                        div()
-                            .text_size(font_size::SM)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.text_muted)
-                            .child("HTTP ROUTES"),
-                    )
-                    .children(props.http_routes.iter().flat_map(|route| {
-                        route.backends.iter().map(|backend| {
-                            let ns = backend
-                                .namespace
-                                .clone()
-                                .unwrap_or_else(|| route.namespace.clone());
-                            render_flow_row(
-                                &format!(
-                                    "🌐 {}",
-                                    route.hostnames.first().unwrap_or(&"*".to_string())
-                                ),
-                                &format!("📦 {}.{}", backend.name, ns),
-                                &format!("{} → :{}", route.paths.join(", "), backend.port),
-                                colors::MAUVE,
-                                true,
-                            )
-                        })
-                    })),
-            )
-        })
-        // Empty state
-        .when(
-            props.port_forwards.is_empty() && props.http_routes.is_empty(),
-            |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .h(px(100.0))
-                        .text_size(font_size::SM)
-                        .text_color(theme.text_muted)
-                        .child("No Kubernetes resources detected"),
-                )
-            },
-        )
-}
-
-fn render_flow_row(
-    from: &str,
-    to: &str,
-    label: &str,
-    color: u32,
-    active: bool,
-) -> impl IntoElement {
-    let theme = Theme::dark();
-    let opacity = if active { 1.0 } else { 0.5 };
-
-    div()
-        .flex()
-        .items_center()
-        .gap(spacing::MD)
-        .opacity(opacity)
-        .px(spacing::SM)
-        .py(spacing::XS)
-        .bg(rgb(colors::SURFACE_0))
-        .rounded(dimensions::BORDER_RADIUS)
-        // From node
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .min_w(px(120.0))
-                .px(spacing::SM)
-                .py(spacing::XS)
-                .bg(rgb(colors::MANTLE))
-                .border_1()
-                .border_color(rgb(color))
-                .rounded(dimensions::BORDER_RADIUS)
-                .child(
-                    div()
-                        .text_size(font_size::SM)
-                        .text_color(theme.text_primary)
-                        .child(from.to_string()),
-                ),
-        )
-        // Arrow with label
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(spacing::XXXS)
-                .child(
-                    div()
-                        .text_size(font_size::XS)
-                        .text_color(rgb(color))
-                        .child(label.to_string()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(div().w(px(60.0)).h(px(2.0)).bg(rgb(color)))
-                        .child(
-                            div()
-                                .text_size(font_size::MD)
-                                .text_color(rgb(color))
-                                .child("→"),
-                        ),
-                ),
-        )
-        // To node
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .min_w(px(200.0))
-                .px(spacing::SM)
-                .py(spacing::XS)
-                .bg(rgb(colors::MANTLE))
-                .border_1()
-                .border_color(rgb(color))
-                .rounded(dimensions::BORDER_RADIUS)
-                .child(
-                    div()
-                        .text_size(font_size::SM)
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.text_primary)
-                        .child(to.to_string()),
-                ),
-        )
+    KubernetesPanel::new(props.clone()).render()
 }

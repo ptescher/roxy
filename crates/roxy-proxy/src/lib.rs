@@ -70,6 +70,8 @@ struct ProxyState {
     request_count: AtomicU64,
     /// Active tunnel count for monitoring
     tunnel_count: AtomicU64,
+    /// Kubectl port-forward manager for K8s service routing
+    kubectl_manager: tokio::sync::Mutex<KubectlPortForwardManager>,
 }
 
 /// HTTP body type alias
@@ -249,10 +251,47 @@ async fn handle_http_forward(
         "Forwarding request"
     );
 
-    // Connect to target and forward request
+    // Connect to target - check if this is a K8s service
     let target_addr = format!("{}:{}", host, port);
+    let is_k8s = KubectlPortForwardManager::is_k8s_service(&host);
 
-    match TcpStream::connect(&target_addr).await {
+    // Determine the actual address to connect to
+    let connect_addr = if is_k8s {
+        if let Some(k8s_service) = K8sService::from_dns_name(&host, port) {
+            info!(
+                request_id = %request_id,
+                service = %k8s_service.name,
+                namespace = %k8s_service.namespace,
+                port = port,
+                "Routing HTTP request to K8s service via port-forward"
+            );
+            let mut manager = state.kubectl_manager.lock().await;
+            match manager.get_or_create_forward(k8s_service).await {
+                Ok(local_addr) => {
+                    info!(
+                        request_id = %request_id,
+                        local_addr = %local_addr,
+                        "K8s port-forward ready, connecting to local address"
+                    );
+                    local_addr.to_string()
+                }
+                Err(e) => {
+                    error!(
+                        request_id = %request_id,
+                        error = %e,
+                        "Failed to create K8s port-forward"
+                    );
+                    target_addr.clone()
+                }
+            }
+        } else {
+            target_addr.clone()
+        }
+    } else {
+        target_addr.clone()
+    };
+
+    match TcpStream::connect(&connect_addr).await {
         Ok(stream) => {
             let io = TokioIo::new(stream);
 
@@ -568,6 +607,7 @@ impl ProxyServer {
             clickhouse,
             request_count: AtomicU64::new(0),
             tunnel_count: AtomicU64::new(0),
+            kubectl_manager: tokio::sync::Mutex::new(KubectlPortForwardManager::new()),
         });
 
         // Create SOCKS5 proxy if enabled, with ClickHouse for protocol interception

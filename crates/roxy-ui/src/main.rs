@@ -27,10 +27,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use components::{
-    connection_detail_panel, connection_list, flow_diagram, open_about_window,
-    ConnectionDetailPanelProps, ConnectionDetailTab, ConnectionListProps, DetailPanel,
-    DetailPanelProps, DetailTab, KubernetesPanelProps, RequestList, RequestListProps, Sidebar,
-    SidebarProps, StatusBar, StatusBarProps, TitleBar, TitleBarProps,
+    connection_detail_panel, connection_list, open_about_window, ConnectionDetailPanelProps,
+    ConnectionDetailTab, ConnectionListProps, DetailPanel, DetailPanelProps, DetailTab,
+    KubernetesPanel, KubernetesPanelProps, LeftDock, LeftDockProps, LeftDockTab, RequestList,
+    RequestListProps, StatusBar, StatusBarProps, TitleBar, TitleBarProps,
 };
 use state::{AppState, ProxyStatus, UiMessage, ViewMode};
 use theme::{colors, dimensions, font_size, spacing};
@@ -265,44 +265,146 @@ impl RoxyApp {
         .render()
     }
 
-    /// Render the sidebar component
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Render the left dock component with tabs
+    fn render_left_dock(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
+
+        // Tab change callback
+        let on_tab_change: Arc<dyn Fn(LeftDockTab, &mut App) + Send + Sync + 'static> = {
+            let entity = entity.clone();
+            Arc::new(move |tab: LeftDockTab, cx: &mut App| {
+                entity.update(cx, |app, cx| {
+                    app.state.set_left_dock_tab(tab);
+                    // Load K8s contexts from system kubeconfig when switching to Kubernetes tab
+                    if tab == LeftDockTab::Kubernetes && app.state.kube_contexts.is_empty() {
+                        app.state.load_kube_contexts();
+                    }
+                    cx.notify();
+                });
+            })
+        };
+
+        // Host selection callback - switches to Requests view
         let on_host_select: Arc<dyn Fn(&str, &mut App) + Send + Sync + 'static> = {
             let entity = entity.clone();
             Arc::new(move |host: &str, cx: &mut App| {
                 let host = host.to_string();
                 entity.update(cx, |app, cx| {
                     app.state.select_host(host);
+                    // Switch to Requests view when a host is selected
+                    app.state.set_view_mode(ViewMode::Requests);
                     cx.notify();
                 });
             })
         };
 
-        let on_clear_filter: Arc<dyn Fn(&mut App) + Send + Sync + 'static> = {
+        // Clear host filter callback - switches to Requests view
+        let on_clear_host_filter: Arc<dyn Fn(&mut App) + Send + Sync + 'static> = {
             let entity = entity.clone();
             Arc::new(move |cx: &mut App| {
                 entity.update(cx, |app, cx| {
                     app.state.clear_host_filter();
+                    // Switch to Requests view
+                    app.state.set_view_mode(ViewMode::Requests);
                     cx.notify();
                 });
             })
         };
 
-        Sidebar::new(SidebarProps {
+        // Service selection callback - switches to Requests view
+        let on_service_select: Arc<dyn Fn(&str, &mut App) + Send + Sync + 'static> = {
+            let entity = entity.clone();
+            Arc::new(move |service: &str, cx: &mut App| {
+                let service = service.to_string();
+                entity.update(cx, |app, cx| {
+                    app.state.select_service(service);
+                    // Switch to Requests view when a service is selected
+                    app.state.set_view_mode(ViewMode::Requests);
+                    cx.notify();
+                });
+            })
+        };
+
+        // Clear service filter callback - switches to Requests view
+        let on_clear_service_filter: Arc<dyn Fn(&mut App) + Send + Sync + 'static> = {
+            let entity = entity.clone();
+            Arc::new(move |cx: &mut App| {
+                entity.update(cx, |app, cx| {
+                    app.state.clear_service_filter();
+                    // Switch to Requests view
+                    app.state.set_view_mode(ViewMode::Requests);
+                    cx.notify();
+                });
+            })
+        };
+
+        // Kubernetes context selection callback
+        let on_context_select: Arc<dyn Fn(&str, &mut App) + Send + Sync + 'static> = {
+            let entity = entity.clone();
+            Arc::new(move |context: &str, cx: &mut App| {
+                let context = context.to_string();
+                entity.update(cx, |app, cx| {
+                    app.state.select_kube_context(context);
+                    cx.notify();
+                });
+            })
+        };
+
+        // Kubernetes namespace selection callback
+        let on_namespace_select: Arc<dyn Fn(Option<&str>, &mut App) + Send + Sync + 'static> = {
+            let entity = entity.clone();
+            Arc::new(move |namespace: Option<&str>, cx: &mut App| {
+                let namespace = namespace.map(|s| s.to_string());
+                entity.update(cx, |app, cx| {
+                    app.state.select_kube_namespace(namespace);
+                    // Switch to Kubernetes view when a namespace is selected
+                    app.state.set_view_mode(ViewMode::Kubernetes);
+                    cx.notify();
+                });
+            })
+        };
+
+        // Toggle context dropdown callback
+        let on_toggle_context_dropdown: Arc<dyn Fn(&mut App) + Send + Sync + 'static> = {
+            let entity = entity.clone();
+            Arc::new(move |cx: &mut App| {
+                entity.update(cx, |app, cx| {
+                    app.state.toggle_context_dropdown();
+                    cx.notify();
+                });
+            })
+        };
+
+        LeftDock::new(LeftDockProps {
+            active_tab: self.state.left_dock_tab,
             proxy_status: self.state.proxy_status.clone(),
             hosts: self.state.hosts.clone(),
             selected_host: self.state.selected_host.clone(),
+            services: self.state.services.clone(),
+            selected_service: self.state.selected_service.clone(),
+            kube_contexts: self.state.kube_contexts.clone(),
+            selected_context: self.state.selected_kube_context.clone(),
+            kube_namespaces: self.state.kube_namespaces.clone(),
+            selected_namespace: self.state.selected_kube_namespace.clone(),
             on_host_select: Some(on_host_select),
-            on_clear_filter: Some(on_clear_filter),
+            on_clear_host_filter: Some(on_clear_host_filter),
+            on_service_select: Some(on_service_select),
+            on_clear_service_filter: Some(on_clear_service_filter),
+            on_namespace_select: Some(on_namespace_select),
+            on_context_select: Some(on_context_select),
+            on_tab_change: Some(on_tab_change),
+            context_dropdown_expanded: self.state.context_dropdown_expanded,
+            on_toggle_context_dropdown: Some(on_toggle_context_dropdown),
             width: self.state.sidebar_width,
-            scroll_handle: self.state.sidebar_scroll_handle.clone(),
+            hosts_scroll_handle: self.state.sidebar_scroll_handle.clone(),
+            services_scroll_handle: self.state.services_scroll_handle.clone(),
+            kubernetes_scroll_handle: self.state.kube_namespaces_scroll_handle.clone(),
         })
         .render()
     }
 
-    /// Render the sidebar resize handle
-    fn render_sidebar_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Render the left dock resize handle
+    fn render_left_dock_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
 
         div()
@@ -315,7 +417,7 @@ impl RoxyApp {
                 let entity = entity.clone();
                 move |_event, _window, cx| {
                     entity.update(cx, |app, cx| {
-                        app.state.start_resizing_sidebar();
+                        app.state.start_resizing_left_dock();
                         cx.notify();
                     });
                 }
@@ -347,14 +449,17 @@ impl RoxyApp {
     fn render_main_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // The detail panel has a fixed height from state
         let detail_height = self.state.detail_panel_height;
+        let is_kubernetes_mode = self.state.view_mode == ViewMode::Kubernetes;
 
         div()
             .flex()
             .flex_col()
             .flex_1()
             .overflow_hidden()
-            // Toolbar with view switcher - fixed height, no shrink
-            .child(div().flex_shrink_0().child(self.render_toolbar(cx)))
+            // Toolbar with view switcher - only show for HTTP/Connections mode
+            .when(!is_kubernetes_mode, |this| {
+                this.child(div().flex_shrink_0().child(self.render_toolbar(cx)))
+            })
             // Main content area - depends on view mode
             .when(self.state.view_mode == ViewMode::Requests, |this| {
                 this
@@ -409,9 +514,9 @@ impl RoxyApp {
             })
     }
 
-    /// Render the toolbar component with view switcher
+    /// Render the toolbar component with view switcher (HTTP/Connections only)
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity().clone();
+        let _entity = cx.entity().clone();
         let view_mode = self.state.view_mode;
 
         div()
@@ -423,17 +528,16 @@ impl RoxyApp {
             .border_b_1()
             .border_color(rgb(colors::SURFACE_0))
             .bg(rgb(colors::BASE))
-            // Left side - view mode tabs
+            // Left side - view mode tabs (only HTTP and Connections)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(spacing::XXS)
                     .child(self.render_view_tab(ViewMode::Requests, view_mode, cx))
-                    .child(self.render_view_tab(ViewMode::Connections, view_mode, cx))
-                    .child(self.render_view_tab(ViewMode::Kubernetes, view_mode, cx)),
+                    .child(self.render_view_tab(ViewMode::Connections, view_mode, cx)),
             )
-            // Right side - request count or k8s status
+            // Right side - request count or connection count
             .child(
                 div()
                     .text_size(font_size::SM)
@@ -443,9 +547,7 @@ impl RoxyApp {
                         ViewMode::Connections => {
                             format!("{} connections", self.state.tcp_connections.len())
                         }
-                        ViewMode::Kubernetes => {
-                            format!("{} port forwards", self.state.k8s_port_forwards.len())
-                        }
+                        ViewMode::Kubernetes => String::new(), // Not shown in toolbar mode
                     }),
             )
     }
@@ -497,18 +599,18 @@ impl RoxyApp {
     /// Render the Kubernetes overview panel
     fn render_kubernetes_panel(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let props = KubernetesPanelProps {
-            port_forwards: self.state.k8s_port_forwards.clone(),
+            gateways: self.state.k8s_gateways.clone(),
+            ingresses: self.state.k8s_ingresses.clone(),
             http_routes: self.state.k8s_http_routes.clone(),
+            services: self.state.k8s_services.clone(),
+            port_forwards: self.state.k8s_port_forwards.clone(),
+            selected_namespace: self.state.selected_kube_namespace.clone(),
             width: 800.0, // Will be overridden by flex
             height: 600.0,
             scroll_handle: self.state.kubernetes_scroll_handle.clone(),
         };
 
-        div()
-            .flex_1()
-            .overflow_hidden()
-            .p(spacing::MD)
-            .child(flow_diagram(&props))
+        KubernetesPanel::new(props).render()
     }
 
     /// Render the request list component
@@ -682,8 +784,8 @@ impl Render for RoxyApp {
                     .flex_row()
                     .flex_1()
                     .overflow_hidden()
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_sidebar_resize_handle(cx))
+                    .child(self.render_left_dock(cx))
+                    .child(self.render_left_dock_resize_handle(cx))
                     .child(self.render_main_content(cx)),
             )
             .child(self.render_status_bar(cx));
