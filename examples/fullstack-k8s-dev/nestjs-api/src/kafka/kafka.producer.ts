@@ -65,29 +65,151 @@ export class KafkaProducer implements OnModuleInit, OnModuleDestroy {
 
       kafkaConfig.socketFactory = ({ host, port, ssl, onConnect }) => {
         const useSsl = ssl !== undefined && ssl !== null;
-        const socket = this.createSocksSocket(
-          socksProxy,
-          host,
-          port,
-          useSsl,
-          ssl,
+        this.logger.debug(
+          `Creating SOCKS connection to ${host}:${port} (ssl: ${useSsl})`,
         );
 
-        socket
-          .then((sock) => {
-            sock.on("connect", () => {
-              onConnect();
+        // Create a Duplex stream that will buffer writes until SOCKS connects
+        const { Duplex } = require("stream");
+        let socksConnected = false;
+        let targetSocket: net.Socket | tls.TLSSocket | null = null;
+        const pendingWrites: Array<{
+          chunk: Buffer;
+          encoding: BufferEncoding;
+          callback: (error?: Error | null) => void;
+        }> = [];
+
+        const proxySocket = new Duplex({
+          read() {
+            // Reading is handled by piping from targetSocket
+          },
+          write(
+            chunk: Buffer,
+            encoding: BufferEncoding,
+            callback: (error?: Error | null) => void,
+          ) {
+            if (socksConnected && targetSocket) {
+              targetSocket.write(chunk, encoding, callback);
+            } else {
+              // Buffer writes until connected
+              pendingWrites.push({ chunk, encoding, callback });
+            }
+          },
+          final(callback: (error?: Error | null) => void) {
+            if (targetSocket) {
+              targetSocket.end(callback);
+            } else {
+              callback();
+            }
+          },
+        });
+
+        // Make it look like a socket for KafkaJS
+        (proxySocket as any).setKeepAlive = (
+          enable: boolean,
+          delay?: number,
+        ) => {
+          if (targetSocket) targetSocket.setKeepAlive(enable, delay);
+        };
+        (proxySocket as any).setNoDelay = (noDelay?: boolean) => {
+          if (targetSocket) targetSocket.setNoDelay(noDelay);
+        };
+        (proxySocket as any).setTimeout = (
+          timeout: number,
+          callback?: () => void,
+        ) => {
+          if (targetSocket) targetSocket.setTimeout(timeout, callback);
+        };
+
+        // Connect to SOCKS proxy
+        SocksClient.createConnection({
+          proxy: {
+            host: socksProxy.host,
+            port: socksProxy.port,
+            type: 5,
+          },
+          command: "connect",
+          destination: {
+            host,
+            port,
+          },
+          timeout: 10000,
+        })
+          .then(({ socket: socksSocket }) => {
+            this.logger.debug(`SOCKS tunnel established to ${host}:${port}`);
+
+            if (useSsl) {
+              // Upgrade to TLS
+              targetSocket = tls.connect({
+                ...ssl,
+                socket: socksSocket,
+                servername: host,
+              });
+
+              targetSocket.on("secureConnect", () => {
+                this.logger.debug(
+                  `TLS connection established to ${host}:${port}`,
+                );
+                socksConnected = true;
+                // Flush pending writes
+                for (const { chunk, encoding, callback } of pendingWrites) {
+                  targetSocket!.write(chunk, encoding, callback);
+                }
+                pendingWrites.length = 0;
+                onConnect();
+              });
+            } else {
+              targetSocket = socksSocket;
+              socksConnected = true;
+              // Flush pending writes
+              for (const { chunk, encoding, callback } of pendingWrites) {
+                targetSocket.write(chunk, encoding, callback);
+              }
+              pendingWrites.length = 0;
+              // Signal connection ready
+              setImmediate(() => {
+                onConnect();
+              });
+            }
+
+            // Forward data from target to proxy (for KafkaJS to read)
+            targetSocket.on("data", (data) => {
+              proxySocket.push(data);
+            });
+
+            targetSocket.on("end", () => {
+              proxySocket.push(null);
+            });
+
+            targetSocket.on("error", (err) => {
+              this.logger.error(
+                `Socket error for ${host}:${port}: ${err.message}`,
+              );
+              proxySocket.destroy(err);
+            });
+
+            targetSocket.on("close", () => {
+              this.logger.debug(`Connection to ${host}:${port} closed`);
+              proxySocket.destroy();
+            });
+
+            proxySocket.on("close", () => {
+              if (targetSocket) targetSocket.destroy();
             });
           })
           .catch((err) => {
             this.logger.error(
               `SOCKS5 connection to ${host}:${port} failed: ${err.message}`,
             );
+            // Fail any pending writes
+            for (const { callback } of pendingWrites) {
+              callback(err);
+            }
+            pendingWrites.length = 0;
+            proxySocket.destroy(err);
           });
 
-        // Return a placeholder socket that will be replaced
-        // KafkaJS expects a socket-like object immediately
-        return this.createProxiedSocket(socket);
+        return proxySocket as unknown as net.Socket;
       };
     } else {
       this.logger.log(`Kafka brokers: ${brokers.join(", ")}`);
@@ -137,70 +259,6 @@ export class KafkaProducer implements OnModuleInit, OnModuleDestroy {
       }
       return null;
     }
-  }
-
-  /**
-   * Create a socket connection through SOCKS5 proxy
-   */
-  private async createSocksSocket(
-    proxy: { host: string; port: number },
-    targetHost: string,
-    targetPort: number,
-    useSsl: boolean,
-    sslOptions?: tls.ConnectionOptions,
-  ): Promise<net.Socket> {
-    const { socket } = await SocksClient.createConnection({
-      proxy: {
-        host: proxy.host,
-        port: proxy.port,
-        type: 5, // SOCKS5
-      },
-      command: "connect",
-      destination: {
-        host: targetHost,
-        port: targetPort,
-      },
-    });
-
-    if (useSsl) {
-      // Upgrade to TLS if needed
-      return tls.connect({
-        ...sslOptions,
-        socket,
-        servername: targetHost,
-      });
-    }
-
-    return socket;
-  }
-
-  /**
-   * Create a proxied socket that wraps an async socket creation
-   */
-  private createProxiedSocket(socketPromise: Promise<net.Socket>): net.Socket {
-    // Create a pass-through socket
-    const passthrough = new net.Socket();
-
-    socketPromise
-      .then((actualSocket) => {
-        // Pipe data between passthrough and actual socket
-        actualSocket.pipe(passthrough);
-        passthrough.pipe(actualSocket);
-
-        // Forward events
-        actualSocket.on("error", (err) => passthrough.emit("error", err));
-        actualSocket.on("close", () => passthrough.destroy());
-        passthrough.on("close", () => actualSocket.destroy());
-
-        // Emit connect event
-        passthrough.emit("connect");
-      })
-      .catch((err) => {
-        passthrough.emit("error", err);
-        passthrough.destroy();
-      });
-
-    return passthrough;
   }
 
   async onModuleInit() {

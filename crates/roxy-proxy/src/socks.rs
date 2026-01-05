@@ -17,6 +17,7 @@
 //! Then configure your database connection to use the SOCKS proxy.
 
 use crate::kubectl::{K8sService, KubectlPortForwardManager};
+use crate::protocol::run_intercepting_tunnel_generic;
 use crate::protocol::{run_intercepting_tunnel, InterceptConfig, Protocol};
 use roxy_core::RoxyClickHouse;
 use std::collections::HashMap;
@@ -27,7 +28,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Default SOCKS5 proxy port
 pub const DEFAULT_SOCKS_PORT: u16 = 1080;
@@ -161,6 +162,9 @@ pub enum SocksError {
 
     #[error("DNS resolution failed for {0}")]
     DnsResolutionFailed(String),
+
+    #[error("Kubernetes error: {0}")]
+    Kube(#[from] crate::kubectl::KubeError),
 }
 
 /// Port forward mapping for Kubernetes services
@@ -454,7 +458,78 @@ async fn handle_client(
         return Err(SocksError::CommandNotSupported(command));
     }
 
-    // Step 4: Resolve the target address (checking port forwards, then kubectl)
+    // Check if this is a Kubernetes service - use direct stream to avoid race condition
+    if let TargetAddr::Domain(domain) = &target_addr {
+        if let Some(k8s_service) = K8sService::from_dns_name(domain, target_port) {
+            debug!(
+                "Detected K8s service: {}.{} port {} - using direct stream",
+                k8s_service.name, k8s_service.namespace, k8s_service.port
+            );
+
+            // Get a direct stream from Kubernetes (this waits for the connection to be ready)
+            // We acquire the write lock only for the duration of getting the K8sStream,
+            // then release it before running the tunnel to avoid blocking other connections.
+            let mut k8s_stream = {
+                let mut manager = kubectl_manager.write().await;
+                manager.get_direct_stream(k8s_service).await?
+                // Manager lock is dropped here
+            };
+            trace!("Released kubectl_manager write lock");
+
+            // Take the stream - this must succeed since we just created it
+            let target_stream = k8s_stream.take_stream().ok_or_else(|| {
+                SocksError::ConnectionFailed("Failed to get K8s stream".to_string())
+            })?;
+
+            // Use localhost as the bound address for SOCKS reply
+            let bound_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), target_port);
+
+            info!(
+                "SOCKS5 tunnel (K8s direct): {} -> {}:{}",
+                client_addr, target_addr, target_port
+            );
+
+            // Send success reply and flush to ensure client receives it
+            send_reply(&mut stream, Reply::Succeeded, Some(bound_addr)).await?;
+            stream.flush().await?;
+
+            // Start bidirectional copy with protocol interception using generic version
+            let target_host = format!("{}:{}", target_addr, target_port);
+            let intercept_stats = run_intercepting_tunnel_generic(
+                stream,
+                target_stream,
+                client_addr,
+                bound_addr,
+                target_port,
+                target_host,
+                clickhouse.clone(),
+                intercept_config.clone(),
+            )
+            .await;
+
+            // Update stats
+            update_stats(&stats, &intercept_stats);
+
+            debug!(
+                "K8s tunnel closed: {} -> {}:{} (sent: {}, received: {}, protocol: {:?})",
+                client_addr,
+                target_addr,
+                target_port,
+                intercept_stats.bytes_sent,
+                intercept_stats.bytes_received,
+                intercept_stats.protocol
+            );
+
+            // Clean up the K8s stream
+            if let Err(e) = k8s_stream.join().await {
+                debug!("K8s stream join error (may be expected): {}", e);
+            }
+
+            return Ok(());
+        }
+    }
+
+    // Step 4: Resolve the target address (for non-K8s targets)
     let resolved_addr =
         resolve_target_with_forwards(&target_addr, target_port, &port_forwards, &kubectl_manager)
             .await;
@@ -487,31 +562,7 @@ async fn handle_client(
                     .await;
 
                     // Update stats from interception
-                    stats
-                        .bytes_sent
-                        .fetch_add(intercept_stats.bytes_sent, Ordering::Relaxed);
-                    stats
-                        .bytes_received
-                        .fetch_add(intercept_stats.bytes_received, Ordering::Relaxed);
-
-                    // Track protocol-specific stats
-                    if let Some(protocol) = intercept_stats.protocol {
-                        match protocol {
-                            Protocol::PostgreSQL => {
-                                stats.postgres_connections.fetch_add(1, Ordering::Relaxed);
-                                stats
-                                    .database_queries
-                                    .fetch_add(intercept_stats.client_messages, Ordering::Relaxed);
-                            }
-                            Protocol::Kafka => {
-                                stats.kafka_connections.fetch_add(1, Ordering::Relaxed);
-                                stats
-                                    .kafka_messages
-                                    .fetch_add(intercept_stats.client_messages, Ordering::Relaxed);
-                            }
-                            Protocol::Unknown => {}
-                        }
-                    }
+                    update_stats(&stats, &intercept_stats);
 
                     debug!(
                         "Tunnel closed: {} -> {}:{} (sent: {}, received: {}, protocol: {:?})",
@@ -720,12 +771,42 @@ async fn send_reply(
     Ok(())
 }
 
-/// Resolve target address, checking port forwards first, then kubectl for K8s services
+/// Update stats from interception results
+fn update_stats(stats: &Arc<SocksStats>, intercept_stats: &crate::protocol::InterceptStats) {
+    stats
+        .bytes_sent
+        .fetch_add(intercept_stats.bytes_sent, Ordering::Relaxed);
+    stats
+        .bytes_received
+        .fetch_add(intercept_stats.bytes_received, Ordering::Relaxed);
+
+    // Track protocol-specific stats
+    if let Some(protocol) = intercept_stats.protocol {
+        match protocol {
+            Protocol::PostgreSQL => {
+                stats.postgres_connections.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .database_queries
+                    .fetch_add(intercept_stats.client_messages, Ordering::Relaxed);
+            }
+            Protocol::Kafka => {
+                stats.kafka_connections.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .kafka_messages
+                    .fetch_add(intercept_stats.client_messages, Ordering::Relaxed);
+            }
+            Protocol::Unknown => {}
+        }
+    }
+}
+
+/// Resolve target address, checking port forwards first
+/// Note: K8s services are now handled directly in handle_client using direct streams
 async fn resolve_target_with_forwards(
     addr: &TargetAddr,
     port: u16,
     port_forwards: &Arc<RwLock<HashMap<String, SocketAddr>>>,
-    kubectl_manager: &Arc<RwLock<KubectlPortForwardManager>>,
+    _kubectl_manager: &Arc<RwLock<KubectlPortForwardManager>>,
 ) -> Result<SocketAddr, SocksError> {
     match addr {
         TargetAddr::Ip(ip) => Ok(SocketAddr::new(*ip, port)),
@@ -761,31 +842,8 @@ async fn resolve_target_with_forwards(
 
             drop(forwards);
 
-            // Check if this is a Kubernetes service DNS name
-            if let Some(k8s_service) = K8sService::from_dns_name(domain, port) {
-                debug!(
-                    "Detected K8s service: {}.{} port {}",
-                    k8s_service.name, k8s_service.namespace, k8s_service.port
-                );
-
-                // Use kubectl port-forward to reach the service
-                let mut manager = kubectl_manager.write().await;
-                match manager.get_or_create_forward(k8s_service).await {
-                    Ok(local_addr) => {
-                        info!("K8s port-forward established: {} -> {}", domain, local_addr);
-                        return Ok(local_addr);
-                    }
-                    Err(e) => {
-                        warn!("kubectl port-forward failed for {}: {}", domain, e);
-                        return Err(SocksError::ConnectionFailed(format!(
-                            "kubectl port-forward failed: {}",
-                            e
-                        )));
-                    }
-                }
-            }
-
-            // Not a K8s service, try regular DNS resolution
+            // K8s services are handled in handle_client directly, so if we get here
+            // for a K8s service, something went wrong - but try DNS anyway
             debug!("No port forward for {}, attempting DNS resolution", domain);
 
             let addr_str = format!("{}:{}", domain, port);
