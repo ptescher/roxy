@@ -209,6 +209,7 @@ pub mod dimensions {
     pub const REQUEST_ROW_HEIGHT: Pixels = px(36.0);
     pub const REQUEST_HEADER_HEIGHT: Pixels = px(32.0);
     pub const DETAIL_PANEL_HEIGHT: Pixels = px(300.0);
+    pub const DETAIL_PANEL_TABS_HEIGHT: Pixels = px(32.0);
     pub const TAB_HEIGHT: Pixels = px(36.0);
 
     pub const TRAFFIC_LIGHT_X: Pixels = px(10.0);

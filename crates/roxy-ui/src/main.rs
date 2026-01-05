@@ -27,10 +27,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use components::{
-    connection_detail_panel, connection_list, open_about_window, ConnectionDetailPanelProps,
-    ConnectionDetailTab, ConnectionListProps, DetailPanel, DetailPanelProps, DetailTab,
-    KubernetesPanel, KubernetesPanelProps, LeftDock, LeftDockProps, LeftDockTab, RequestList,
-    RequestListProps, StatusBar, StatusBarProps, TitleBar, TitleBarProps,
+    connection_detail_panel, connection_list, database_detail_panel, database_list,
+    messaging_detail_panel, messaging_list, open_about_window, ConnectionDetailPanelProps,
+    ConnectionDetailTab, ConnectionListProps, DatabaseDetailPanelProps, DatabaseDetailTab,
+    DatabaseListProps, DetailPanel, DetailPanelProps, DetailTab, KubernetesPanel,
+    KubernetesPanelProps, LeftDock, LeftDockProps, LeftDockTab, MessagingDetailPanelProps,
+    MessagingDetailTab, MessagingListProps, RequestList, RequestListProps, StatusBar,
+    StatusBarProps, TitleBar, TitleBarProps,
 };
 use state::{AppState, ProxyStatus, UiMessage, ViewMode};
 use theme::{colors, dimensions, font_size, spacing};
@@ -195,32 +198,89 @@ impl RoxyApp {
                         }
                     }
 
-                    // Poll for TCP connections (PostgreSQL, Kafka, etc.)
+                    // Poll for TCP connections (unknown protocols only)
                     tracing::debug!("[POLLER] Poll #{}: Querying TCP connections...", poll_count);
                     match clickhouse.get_recent_connections(100).await {
                         Ok(connections) => {
+                            // Filter to only show unknown protocols in the TCP tab
+                            let unknown_connections: Vec<_> = connections
+                                .into_iter()
+                                .filter(|c| c.protocol == "unknown")
+                                .collect();
                             tracing::info!(
-                                "[POLLER] Poll #{}: SUCCESS - Got {} TCP connections from ClickHouse",
+                                "[POLLER] Poll #{}: SUCCESS - Got {} unknown TCP connections from ClickHouse",
                                 poll_count,
-                                connections.len()
+                                unknown_connections.len()
                             );
-                            for (i, conn) in connections.iter().take(3).enumerate() {
-                                tracing::debug!(
-                                    "[POLLER]   Connection {}: {} {} -> {} ({})",
-                                    i,
-                                    conn.protocol,
-                                    conn.target_host,
-                                    conn.server_address,
-                                    conn.status
-                                );
-                            }
-                            if let Err(e) = poll_tx.send(UiMessage::ConnectionsUpdated(connections)) {
+                            if let Err(e) = poll_tx.send(UiMessage::ConnectionsUpdated(unknown_connections)) {
                                 tracing::error!("[POLLER] Failed to send connections to UI: {}", e);
                             }
                         }
                         Err(e) => {
                             tracing::error!(
                                 "[POLLER] Poll #{}: FAILED to fetch TCP connections: {:?}",
+                                poll_count,
+                                e
+                            );
+                        }
+                    }
+
+                    // Poll for database queries (PostgreSQL, MySQL, etc.)
+                    tracing::debug!("[POLLER] Poll #{}: Querying database queries...", poll_count);
+                    match clickhouse.get_recent_database_queries(100).await {
+                        Ok(queries) => {
+                            tracing::info!(
+                                "[POLLER] Poll #{}: SUCCESS - Got {} database queries from ClickHouse",
+                                poll_count,
+                                queries.len()
+                            );
+                            for (i, query) in queries.iter().take(3).enumerate() {
+                                tracing::debug!(
+                                    "[POLLER]   Query {}: {} {} ({}ms)",
+                                    i,
+                                    query.db_system,
+                                    query.db_operation,
+                                    query.duration_ms
+                                );
+                            }
+                            if let Err(e) = poll_tx.send(UiMessage::DatabaseQueriesUpdated(queries)) {
+                                tracing::error!("[POLLER] Failed to send database queries to UI: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[POLLER] Poll #{}: FAILED to fetch database queries: {:?}",
+                                poll_count,
+                                e
+                            );
+                        }
+                    }
+
+                    // Poll for Kafka messages
+                    tracing::debug!("[POLLER] Poll #{}: Querying Kafka messages...", poll_count);
+                    match clickhouse.get_recent_kafka_messages(100).await {
+                        Ok(messages) => {
+                            tracing::info!(
+                                "[POLLER] Poll #{}: SUCCESS - Got {} Kafka messages from ClickHouse",
+                                poll_count,
+                                messages.len()
+                            );
+                            for (i, msg) in messages.iter().take(3).enumerate() {
+                                tracing::debug!(
+                                    "[POLLER]   Kafka {}: {} {} ({}ms)",
+                                    i,
+                                    msg.messaging_operation,
+                                    msg.messaging_destination,
+                                    msg.duration_ms
+                                );
+                            }
+                            if let Err(e) = poll_tx.send(UiMessage::KafkaMessagesUpdated(messages)) {
+                                tracing::error!("[POLLER] Failed to send Kafka messages to UI: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[POLLER] Poll #{}: FAILED to fetch Kafka messages: {:?}",
                                 poll_count,
                                 e
                             );
@@ -485,9 +545,57 @@ impl RoxyApp {
                             .child(self.render_detail_panel(cx)),
                     )
             })
-            .when(self.state.view_mode == ViewMode::Connections, |this| {
+            .when(self.state.view_mode == ViewMode::Database, |this| {
                 this
-                    // Connection list - fills remaining space
+                    // Database query list - fills remaining space
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(100.0))
+                            .overflow_hidden()
+                            .child(self.render_database_list(cx)),
+                    )
+                    // Resize handle - fixed height, no shrink
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .child(self.render_detail_panel_resize_handle(cx)),
+                    )
+                    // Database detail panel - fixed height from state, no shrink
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(detail_height))
+                            .child(self.render_database_detail_panel(cx)),
+                    )
+            })
+            .when(self.state.view_mode == ViewMode::Messaging, |this| {
+                this
+                    // Kafka/messaging list - fills remaining space
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(100.0))
+                            .overflow_hidden()
+                            .child(self.render_messaging_list(cx)),
+                    )
+                    // Resize handle - fixed height, no shrink
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .child(self.render_detail_panel_resize_handle(cx)),
+                    )
+                    // Messaging detail panel - fixed height from state, no shrink
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(detail_height))
+                            .child(self.render_messaging_detail_panel(cx)),
+                    )
+            })
+            .when(self.state.view_mode == ViewMode::TCP, |this| {
+                this
+                    // TCP connection list - fills remaining space
                     .child(
                         div()
                             .flex_1()
@@ -514,7 +622,7 @@ impl RoxyApp {
             })
     }
 
-    /// Render the toolbar component with view switcher (HTTP/Connections only)
+    /// Render the toolbar component with view switcher (HTTP/Database/Messaging/TCP)
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let _entity = cx.entity().clone();
         let view_mode = self.state.view_mode;
@@ -528,23 +636,31 @@ impl RoxyApp {
             .border_b_1()
             .border_color(rgb(colors::SURFACE_0))
             .bg(rgb(colors::BASE))
-            // Left side - view mode tabs (only HTTP and Connections)
+            // Left side - view mode tabs (HTTP, Database, Messaging, TCP)
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(spacing::XXS)
                     .child(self.render_view_tab(ViewMode::Requests, view_mode, cx))
-                    .child(self.render_view_tab(ViewMode::Connections, view_mode, cx)),
+                    .child(self.render_view_tab(ViewMode::Database, view_mode, cx))
+                    .child(self.render_view_tab(ViewMode::Messaging, view_mode, cx))
+                    .child(self.render_view_tab(ViewMode::TCP, view_mode, cx)),
             )
-            // Right side - request count or connection count
+            // Right side - count for current view
             .child(
                 div()
                     .text_size(font_size::SM)
                     .text_color(rgb(colors::SUBTEXT_0))
                     .child(match view_mode {
                         ViewMode::Requests => format!("{} requests", self.state.request_count()),
-                        ViewMode::Connections => {
+                        ViewMode::Database => {
+                            format!("{} queries", self.state.database_queries.len())
+                        }
+                        ViewMode::Messaging => {
+                            format!("{} messages", self.state.kafka_messages.len())
+                        }
+                        ViewMode::TCP => {
                             format!("{} connections", self.state.tcp_connections.len())
                         }
                         ViewMode::Kubernetes => String::new(), // Not shown in toolbar mode
@@ -692,6 +808,96 @@ impl RoxyApp {
                 .map(|c| c.id.clone()),
             on_connection_select: Some(on_connection_select),
             scroll_handle: self.state.connections_scroll_handle.clone(),
+        })
+    }
+
+    /// Render the database query list component
+    fn render_database_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let on_query_select: Arc<
+            dyn Fn(&roxy_core::DatabaseQueryRow, &mut App) + Send + Sync + 'static,
+        > = Arc::new(move |query: &roxy_core::DatabaseQueryRow, cx: &mut App| {
+            let query = query.clone();
+            entity.update(cx, |app, cx| {
+                app.state.selected_database_query = Some(query);
+                cx.notify();
+            });
+        });
+
+        database_list(DatabaseListProps {
+            queries: self.state.database_queries.clone(),
+            selected_query_id: self
+                .state
+                .selected_database_query
+                .as_ref()
+                .map(|q| q.id.clone()),
+            on_query_select: Some(on_query_select),
+            scroll_handle: self.state.database_list_scroll_handle.clone(),
+        })
+    }
+
+    /// Render the database detail panel
+    fn render_database_detail_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let on_tab_select: Arc<dyn Fn(DatabaseDetailTab, &mut App) + Send + Sync + 'static> =
+            Arc::new(move |tab: DatabaseDetailTab, cx: &mut App| {
+                entity.update(cx, |app, cx| {
+                    app.state.active_database_detail_tab = tab;
+                    cx.notify();
+                });
+            });
+
+        database_detail_panel(DatabaseDetailPanelProps {
+            selected_query: self.state.selected_database_query.clone(),
+            active_tab: self.state.active_database_detail_tab,
+            on_tab_select: Some(on_tab_select),
+            height: self.state.detail_panel_height,
+            scroll_handle: self.state.database_detail_scroll_handle.clone(),
+        })
+    }
+
+    /// Render the messaging list component
+    fn render_messaging_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let on_message_select: Arc<
+            dyn Fn(&roxy_core::KafkaMessageRow, &mut App) + Send + Sync + 'static,
+        > = Arc::new(move |message: &roxy_core::KafkaMessageRow, cx: &mut App| {
+            let message = message.clone();
+            entity.update(cx, |app, cx| {
+                app.state.selected_kafka_message = Some(message);
+                cx.notify();
+            });
+        });
+
+        messaging_list(MessagingListProps {
+            messages: self.state.kafka_messages.clone(),
+            selected_message_id: self
+                .state
+                .selected_kafka_message
+                .as_ref()
+                .map(|m| m.id.clone()),
+            on_message_select: Some(on_message_select),
+            scroll_handle: self.state.messaging_list_scroll_handle.clone(),
+        })
+    }
+
+    /// Render the messaging detail panel
+    fn render_messaging_detail_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let on_tab_select: Arc<dyn Fn(MessagingDetailTab, &mut App) + Send + Sync + 'static> =
+            Arc::new(move |tab: MessagingDetailTab, cx: &mut App| {
+                entity.update(cx, |app, cx| {
+                    app.state.active_messaging_detail_tab = tab;
+                    cx.notify();
+                });
+            });
+
+        messaging_detail_panel(MessagingDetailPanelProps {
+            selected_message: self.state.selected_kafka_message.clone(),
+            active_tab: self.state.active_messaging_detail_tab,
+            on_tab_select: Some(on_tab_select),
+            height: self.state.detail_panel_height,
+            scroll_handle: self.state.messaging_detail_scroll_handle.clone(),
         })
     }
 
