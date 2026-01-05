@@ -37,6 +37,8 @@ pub struct InterceptConfig {
     pub record_connection_spans: bool,
     /// Connection timeout in seconds (0 = no timeout)
     pub connection_timeout_secs: u64,
+    /// Idle timeout in seconds - close connection if no data for this long (0 = no timeout)
+    pub idle_timeout_secs: u64,
 }
 
 impl Default for InterceptConfig {
@@ -48,7 +50,8 @@ impl Default for InterceptConfig {
             buffer_size: 32 * 1024,      // 32 KB
             detection_timeout_ms: 500,   // 500ms for protocol detection
             record_connection_spans: true,
-            connection_timeout_secs: 60, // 60 second connection timeout
+            connection_timeout_secs: 300, // 5 minute max connection timeout
+            idle_timeout_secs: 30,        // 30 second idle timeout
         }
     }
 }
@@ -174,6 +177,85 @@ pub async fn run_intercepting_tunnel(
     let (client_read, client_write) = client.into_split();
     let (target_read, target_write) = target.into_split();
 
+    run_intercepting_tunnel_inner(
+        client_read,
+        client_write,
+        target_read,
+        target_write,
+        client_addr,
+        target_addr,
+        target_port,
+        clickhouse,
+        config,
+        &mut stats,
+    )
+    .await;
+
+    stats
+}
+
+/// Run an intercepting tunnel with generic stream types
+///
+/// This version works with any AsyncRead/AsyncWrite streams, not just TcpStream.
+/// This is useful for K8s port-forward streams where we get a stream directly
+/// from the Kubernetes API instead of going through a local TCP listener.
+pub async fn run_intercepting_tunnel_generic<C, T>(
+    client: C,
+    target: T,
+    client_addr: SocketAddr,
+    target_addr: SocketAddr,
+    target_port: u16,
+    target_host: String,
+    clickhouse: Option<Arc<RoxyClickHouse>>,
+    config: InterceptConfig,
+) -> InterceptStats
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut stats = InterceptStats::default();
+    stats.start_time = Some(Instant::now());
+    stats.target_host = target_host;
+
+    // Split streams for bidirectional communication
+    let (client_read, client_write) = tokio::io::split(client);
+    let (target_read, target_write) = tokio::io::split(target);
+
+    run_intercepting_tunnel_inner(
+        client_read,
+        client_write,
+        target_read,
+        target_write,
+        client_addr,
+        target_addr,
+        target_port,
+        clickhouse,
+        config,
+        &mut stats,
+    )
+    .await;
+
+    stats
+}
+
+/// Inner implementation of the intercepting tunnel that works with any stream types
+async fn run_intercepting_tunnel_inner<CR, CW, TR, TW>(
+    client_read: CR,
+    client_write: CW,
+    target_read: TR,
+    target_write: TW,
+    client_addr: SocketAddr,
+    target_addr: SocketAddr,
+    target_port: u16,
+    clickhouse: Option<Arc<RoxyClickHouse>>,
+    config: InterceptConfig,
+    stats: &mut InterceptStats,
+) where
+    CR: AsyncRead + Unpin,
+    CW: AsyncWrite + Unpin,
+    TR: AsyncRead + Unpin,
+    TW: AsyncWrite + Unpin,
+{
     // Wrap in buffered intercepting streams with optional timeout
     let tunnel_future = intercept_bidirectional(
         client_read,
@@ -185,7 +267,7 @@ pub async fn run_intercepting_tunnel(
         target_port,
         clickhouse.clone(),
         config.clone(),
-        &mut stats,
+        stats,
     );
 
     let result = if config.connection_timeout_secs > 0 {
@@ -225,11 +307,9 @@ pub async fn run_intercepting_tunnel(
     // Record connection-level span
     if config.record_connection_spans {
         if let Some(ref ch) = clickhouse {
-            record_connection_span(&stats, &client_addr, &target_addr, target_port, ch).await;
+            record_connection_span(stats, &client_addr, &target_addr, target_port, ch).await;
         }
     }
-
-    stats
 }
 
 /// Record a connection-level span and TCP connection record to ClickHouse
@@ -481,7 +561,29 @@ where
     let mut client_buf = vec![0u8; config.buffer_size];
     let mut target_buf = vec![0u8; config.buffer_size];
 
+    // Idle timeout duration
+    let idle_timeout = if config.idle_timeout_secs > 0 {
+        Some(std::time::Duration::from_secs(config.idle_timeout_secs))
+    } else {
+        None
+    };
+    let mut last_activity = Instant::now();
+
     loop {
+        // Check for idle timeout
+        if let Some(timeout) = idle_timeout {
+            if last_activity.elapsed() > timeout {
+                debug!(
+                    "Idle timeout ({}s) - closing connection",
+                    config.idle_timeout_secs
+                );
+                break;
+            }
+        }
+
+        // Use a short timeout on select to periodically check idle timeout
+        let select_timeout = idle_timeout.unwrap_or(std::time::Duration::from_secs(5));
+
         tokio::select! {
             // Client -> Target
             result = client_read.read(&mut client_buf) => {
@@ -493,10 +595,21 @@ where
                         break;
                     }
                     Ok(n) => {
+                        last_activity = Instant::now();
+                        debug!(
+                            "Client -> Server: {} bytes (protocol: {:?})",
+                            n,
+                            stats.protocol
+                        );
                         // Parse and forward
                         // Capture sample request data if we don't have any yet
                         if stats.sample_request.is_empty() && n > 0 {
                             stats.sample_request = client_buf[..n.min(MAX_SAMPLE_BYTES)].to_vec();
+                            // Log first bytes for debugging
+                            debug!(
+                                "First bytes (hex): {}",
+                                TcpConnectionRow::bytes_to_hex(&client_buf[..n.min(32)], 32)
+                            );
                         }
                         if config.record_messages {
                             match stats.protocol {
@@ -546,9 +659,20 @@ where
                         break;
                     }
                     Ok(n) => {
+                        last_activity = Instant::now();
+                        debug!(
+                            "Server -> Client: {} bytes (protocol: {:?})",
+                            n,
+                            stats.protocol
+                        );
                         // Capture sample response data if we don't have any yet
                         if stats.sample_response.is_empty() && n > 0 {
                             stats.sample_response = target_buf[..n.min(MAX_SAMPLE_BYTES)].to_vec();
+                            // Log first bytes for debugging
+                            debug!(
+                                "Response first bytes (hex): {}",
+                                TcpConnectionRow::bytes_to_hex(&target_buf[..n.min(32)], 32)
+                            );
                         }
                         // Parse and forward
                         if config.record_messages {
@@ -588,6 +712,11 @@ where
                         break;
                     }
                 }
+            }
+            // Timeout branch for idle detection
+            _ = tokio::time::sleep(select_timeout) => {
+                // Just continue to check idle timeout at top of loop
+                continue;
             }
         }
     }

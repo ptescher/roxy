@@ -18,7 +18,9 @@ pub mod intercept;
 pub mod kafka;
 pub mod postgres;
 
-pub use intercept::{run_intercepting_tunnel, InterceptConfig, InterceptStats};
+pub use intercept::{
+    run_intercepting_tunnel, run_intercepting_tunnel_generic, InterceptConfig, InterceptStats,
+};
 
 use std::fmt;
 

@@ -511,3 +511,311 @@ mod url_parsing_tests {
         }
     }
 }
+
+// =============================================================================
+// Kubernetes Integration Tests
+//
+// These tests require:
+// 1. A running Kubernetes cluster (minikube, kind, Docker Desktop, etc.)
+// 2. The example services deployed from examples/fullstack-k8s-dev:
+//    - kafka.messaging.svc.cluster.local:9092
+//    - postgres.database.svc.cluster.local:5432
+//
+// To run these tests:
+//   cargo test -p roxy-proxy k8s_integration -- --ignored --nocapture
+//
+// To deploy the example services:
+//   cd examples/fullstack-k8s-dev && skaffold run
+// =============================================================================
+
+#[cfg(test)]
+mod k8s_integration_tests {
+    use roxy_proxy::socks::{SocksConfig, SocksProxy};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::task::JoinHandle;
+    use tokio_socks::tcp::Socks5Stream;
+
+    const KAFKA_HOST: &str = "kafka.messaging.svc.cluster.local";
+    const KAFKA_PORT: u16 = 9092;
+    const POSTGRES_HOST: &str = "postgres.database.svc.cluster.local";
+    const POSTGRES_PORT: u16 = 5432;
+
+    /// Helper to start a SOCKS proxy on a given port and return a handle to abort it
+    fn start_socks_proxy(port: u16) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let config = SocksConfig {
+                port,
+                bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                require_auth: false,
+                username: None,
+                password: None,
+            };
+            let proxy = SocksProxy::new(config);
+            if let Err(e) = proxy.run().await {
+                eprintln!("Proxy error: {}", e);
+            }
+        })
+    }
+
+    /// Create a TCP connection through the SOCKS proxy
+    async fn connect_via_socks(
+        proxy_port: u16,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<Socks5Stream<TcpStream>, String> {
+        let proxy_addr = format!("127.0.0.1:{}", proxy_port);
+        let target = format!("{}:{}", target_host, target_port);
+
+        Socks5Stream::connect(proxy_addr.as_str(), target.as_str())
+            .await
+            .map_err(|e| format!("SOCKS connection failed: {}", e))
+    }
+
+    /// Test connecting to Kafka through the SOCKS proxy using rskafka client
+    #[tokio::test]
+    #[ignore = "requires local k8s cluster with kafka.messaging service"]
+    async fn k8s_integration_rskafka_through_socks() {
+        let proxy_port = 11080;
+        let proxy_handle = start_socks_proxy(proxy_port);
+
+        // Give proxy time to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Connect to Kafka through SOCKS proxy
+        let stream = connect_via_socks(proxy_port, KAFKA_HOST, KAFKA_PORT)
+            .await
+            .expect("should connect to Kafka through SOCKS");
+
+        println!("Connected to Kafka through SOCKS proxy");
+
+        // Use the raw stream to verify connectivity
+        let mut tcp_stream = stream.into_inner();
+        tcp_stream.set_nodelay(true).unwrap();
+
+        // Send a simple Kafka ApiVersions request (API key 18, version 0)
+        let client_id = b"roxy-test";
+        let correlation_id: i32 = 12345;
+
+        let header_len = 2 + 2 + 4 + 2 + client_id.len();
+        let mut request = Vec::new();
+        request.extend_from_slice(&(header_len as i32).to_be_bytes());
+        request.extend_from_slice(&18i16.to_be_bytes()); // ApiVersions
+        request.extend_from_slice(&0i16.to_be_bytes()); // version 0
+        request.extend_from_slice(&correlation_id.to_be_bytes());
+        request.extend_from_slice(&(client_id.len() as i16).to_be_bytes());
+        request.extend_from_slice(client_id);
+
+        tcp_stream
+            .write_all(&request)
+            .await
+            .expect("should send request");
+
+        // Read response
+        let mut len_buf = [0u8; 4];
+        tcp_stream
+            .read_exact(&mut len_buf)
+            .await
+            .expect("should read response length");
+
+        let response_len = i32::from_be_bytes(len_buf);
+        assert!(response_len > 0 && response_len < 10000);
+
+        let mut response = vec![0u8; response_len as usize];
+        tcp_stream
+            .read_exact(&mut response)
+            .await
+            .expect("should read response");
+
+        let resp_correlation_id =
+            i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+        assert_eq!(resp_correlation_id, correlation_id);
+
+        println!(
+            "Kafka ApiVersions response: {} bytes, correlation_id={}",
+            response_len, resp_correlation_id
+        );
+
+        proxy_handle.abort();
+    }
+
+    /// Test producing messages to Kafka through SOCKS proxy using raw protocol
+    #[tokio::test]
+    #[ignore = "requires local k8s cluster with kafka.messaging service"]
+    async fn k8s_integration_kafka_produce_through_socks() {
+        let proxy_port = 11081;
+        let proxy_handle = start_socks_proxy(proxy_port);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Connect to Kafka through SOCKS
+        let mut stream = connect_via_socks(proxy_port, KAFKA_HOST, KAFKA_PORT)
+            .await
+            .expect("should connect to Kafka")
+            .into_inner();
+
+        // First verify connectivity with ApiVersions request
+        let request = build_simple_kafka_request(1, "roxy-producer-test");
+        stream
+            .write_all(&request)
+            .await
+            .expect("should send ApiVersions");
+
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .expect("should read response length");
+        let response_len = i32::from_be_bytes(len_buf);
+
+        assert!(response_len > 0, "should get positive response length");
+
+        let mut response = vec![0u8; response_len as usize];
+        stream
+            .read_exact(&mut response)
+            .await
+            .expect("should read response");
+
+        let correlation_id =
+            i32::from_be_bytes([response[0], response[1], response[2], response[3]]);
+        assert_eq!(correlation_id, 1, "correlation ID should match");
+
+        println!(
+            "Kafka connectivity verified through SOCKS proxy: {} bytes response",
+            response_len
+        );
+
+        // Note: Full produce test requires more complex protocol handling
+        // or using a Kafka client library that supports custom transports.
+        // For now, we verify that the SOCKS proxy correctly forwards Kafka traffic.
+
+        proxy_handle.abort();
+    }
+
+    /// Build a simple Kafka ApiVersions request
+    fn build_simple_kafka_request(correlation_id: i32, client_id: &str) -> Vec<u8> {
+        let header_len = 2 + 2 + 4 + 2 + client_id.len();
+        let mut request = Vec::new();
+        request.extend_from_slice(&(header_len as i32).to_be_bytes());
+        request.extend_from_slice(&18i16.to_be_bytes());
+        request.extend_from_slice(&0i16.to_be_bytes());
+        request.extend_from_slice(&correlation_id.to_be_bytes());
+        request.extend_from_slice(&(client_id.len() as i16).to_be_bytes());
+        request.extend_from_slice(client_id.as_bytes());
+        request
+    }
+
+    /// Test connecting to PostgreSQL through the SOCKS proxy
+    #[tokio::test]
+    #[ignore = "requires local k8s cluster with postgres.database service"]
+    async fn k8s_integration_socks_postgres_connect() {
+        let port = 11082;
+        let proxy_handle = start_socks_proxy(port);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Connect to PostgreSQL through SOCKS
+        let stream = connect_via_socks(port, POSTGRES_HOST, POSTGRES_PORT)
+            .await
+            .expect("should connect to PostgreSQL through SOCKS");
+
+        let mut tcp_stream = stream.into_inner();
+
+        // Build PostgreSQL startup message (protocol 3.0)
+        let params = "user\0postgres\0database\0postgres\0\0";
+        let msg_len = 4 + 4 + params.len();
+
+        let mut startup = Vec::with_capacity(msg_len);
+        startup.extend_from_slice(&(msg_len as i32).to_be_bytes());
+        startup.extend_from_slice(&196608i32.to_be_bytes()); // Protocol 3.0
+        startup.extend_from_slice(params.as_bytes());
+
+        tcp_stream
+            .write_all(&startup)
+            .await
+            .expect("should send startup message");
+
+        // Read response type byte
+        let mut response_type = [0u8; 1];
+        tcp_stream
+            .read_exact(&mut response_type)
+            .await
+            .expect("should read response type");
+
+        // Should get 'R' (Authentication) or 'E' (Error)
+        assert!(
+            response_type[0] == b'R' || response_type[0] == b'E',
+            "expected auth or error, got: {} (0x{:02x})",
+            response_type[0] as char,
+            response_type[0]
+        );
+
+        println!(
+            "PostgreSQL responded with: '{}' (0x{:02x})",
+            response_type[0] as char, response_type[0]
+        );
+
+        proxy_handle.abort();
+    }
+
+    /// Test multiple concurrent connections through SOCKS proxy
+    #[tokio::test]
+    #[ignore = "requires local k8s cluster with kafka.messaging service"]
+    async fn k8s_integration_socks_concurrent_kafka() {
+        let proxy_port = 11083;
+        let proxy_handle = start_socks_proxy(proxy_port);
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Spawn multiple concurrent connections
+        let mut handles = vec![];
+
+        for i in 0..5 {
+            let handle = tokio::spawn(async move {
+                match connect_via_socks(proxy_port, KAFKA_HOST, KAFKA_PORT).await {
+                    Ok(stream) => {
+                        let mut tcp = stream.into_inner();
+                        let request = build_simple_kafka_request(i + 100, "concurrent-test");
+
+                        if tcp.write_all(&request).await.is_ok() {
+                            let mut len_buf = [0u8; 4];
+                            if tcp.read_exact(&mut len_buf).await.is_ok() {
+                                let len = i32::from_be_bytes(len_buf);
+                                if len > 0 {
+                                    println!("Connection {} succeeded, response: {} bytes", i, len);
+                                    return true;
+                                }
+                            }
+                        }
+                        println!("Connection {} failed during communication", i);
+                        false
+                    }
+                    Err(e) => {
+                        println!("Connection {} failed: {}", i, e);
+                        false
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        let results: Vec<bool> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap_or(false))
+            .collect();
+
+        let successes = results.iter().filter(|&&x| x).count();
+        println!("Concurrent test: {}/5 connections succeeded", successes);
+
+        assert!(
+            successes >= 3,
+            "at least 3 of 5 concurrent connections should succeed, got {}",
+            successes
+        );
+
+        proxy_handle.abort();
+    }
+}

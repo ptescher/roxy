@@ -11,7 +11,7 @@ pub mod kubectl;
 pub mod protocol;
 pub mod socks;
 
-pub use kubectl::{K8sService, KubectlPortForwardManager};
+pub use kubectl::{K8sService, K8sStream, KubectlPortForwardManager};
 pub use socks::{SocksConfig, SocksProxy, DEFAULT_SOCKS_PORT};
 
 use anyhow::{Context, Result};
