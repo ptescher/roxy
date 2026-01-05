@@ -1,0 +1,146 @@
+# Config Service for Roxy Example
+#
+# Deploys a simple config/feature-flags service to Kubernetes.
+# Service DNS: config-service.backend.svc.cluster.local:8080
+#
+# When running locally with Roxy and HTTP_PROXY, connections to this
+# K8s DNS address are automatically port-forwarded to the cluster.
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-service-data
+  namespace: backend
+  labels:
+    app: config-service
+    app.kubernetes.io/part-of: roxy-example
+data:
+  features.json: |
+    {
+      "newCheckoutEnabled": true,
+      "inventoryCheckEnabled": true,
+      "notificationsEnabled": true,
+      "analyticsEnabled": false
+    }
+
+  app-config.json: |
+    {
+      "orderLimits": {
+        "maxItemsPerOrder": 100,
+        "maxOrderValue": 10000,
+        "minOrderValue": 1
+      },
+      "taxation": {
+        "defaultTaxRate": 0.08,
+        "taxExemptThreshold": 0
+      },
+      "shipping": {
+        "freeShippingThreshold": 50,
+        "defaultShippingCost": 5.99
+      }
+    }
+
+  nginx.conf: |
+    events {
+      worker_connections 1024;
+    }
+    http {
+      default_type application/json;
+      server {
+        listen 8080;
+
+        location /health {
+          return 200 '{"status":"healthy"}';
+        }
+
+        location /api/v1/features {
+          alias /etc/config-data/features.json;
+        }
+
+        location /api/v1/config/app {
+          alias /etc/config-data/app-config.json;
+        }
+
+        location / {
+          return 200 '{"service":"config-service","version":"1.0.0"}';
+        }
+      }
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: config-service
+  namespace: backend
+  labels:
+    app: config-service
+    app.kubernetes.io/part-of: roxy-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: config-service
+  template:
+    metadata:
+      labels:
+        app: config-service
+    spec:
+      containers:
+        - name: config-service
+          image: nginx:1.25-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: config-data
+              mountPath: /etc/config-data
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: config-service-data
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+        - name: config-data
+          configMap:
+            name: config-service-data
+            items:
+              - key: features.json
+                path: features.json
+              - key: app-config.json
+                path: app-config.json
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: config-service
+  namespace: backend
+  labels:
+    app: config-service
+    app.kubernetes.io/part-of: roxy-example
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: config-service

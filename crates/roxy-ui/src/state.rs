@@ -3,12 +3,36 @@
 //! This module contains the core state management types including
 //! the application state, UI messages, and proxy status.
 
-use crate::components::DetailTab;
+use crate::components::{ConnectionDetailTab, DetailTab, HttpRouteInfo, PortForwardInfo};
 use gpui::ScrollHandle;
-use roxy_core::{ClickHouseConfig, HostSummary, HttpRequestRecord, RoxyClickHouse};
+use roxy_core::{
+    ClickHouseConfig, HostSummary, HttpRequestRecord, RoxyClickHouse, TcpConnectionRow,
+};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// The main view mode for the application
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// Show HTTP requests
+    #[default]
+    Requests,
+    /// Show TCP connections (PostgreSQL, Kafka, etc.)
+    Connections,
+    /// Show Kubernetes overview
+    Kubernetes,
+}
+
+impl ViewMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ViewMode::Requests => "HTTP",
+            ViewMode::Connections => "Connections",
+            ViewMode::Kubernetes => "Kubernetes",
+        }
+    }
+}
 
 /// Messages from background tasks to the UI
 #[derive(Debug)]
@@ -17,12 +41,18 @@ pub enum UiMessage {
     RequestsUpdated(Vec<HttpRequestRecord>),
     /// New hosts summary fetched from ClickHouse
     HostsUpdated(Vec<HostSummary>),
+    /// New TCP connections fetched from ClickHouse
+    ConnectionsUpdated(Vec<TcpConnectionRow>),
     /// Proxy server started successfully
     ProxyStarted,
     /// Proxy server failed to start
     ProxyFailed(String),
     /// General error message
     Error(String),
+    /// Kubernetes port forwards updated
+    PortForwardsUpdated(Vec<PortForwardInfo>),
+    /// Kubernetes HTTP routes updated
+    HttpRoutesUpdated(Vec<HttpRouteInfo>),
 }
 
 /// Proxy server status
@@ -85,6 +115,9 @@ pub struct AppState {
     /// Current proxy status
     pub proxy_status: ProxyStatus,
 
+    /// Whether the system proxy is enabled (routes all macOS traffic through Roxy)
+    pub system_proxy_enabled: bool,
+
     /// List of hosts from ClickHouse
     pub hosts: Vec<HostSummary>,
 
@@ -132,6 +165,33 @@ pub struct AppState {
 
     /// Scroll handle for the detail panel content
     pub detail_panel_scroll_handle: ScrollHandle,
+
+    /// Current view mode (Requests or Kubernetes)
+    pub view_mode: ViewMode,
+
+    /// Active Kubernetes port forwards
+    pub k8s_port_forwards: Vec<PortForwardInfo>,
+
+    /// Kubernetes HTTP routes
+    pub k8s_http_routes: Vec<HttpRouteInfo>,
+
+    /// Scroll handle for the Kubernetes panel
+    pub kubernetes_scroll_handle: ScrollHandle,
+
+    /// List of recent TCP connections (PostgreSQL, Kafka, etc.)
+    pub tcp_connections: Vec<TcpConnectionRow>,
+
+    /// Currently selected TCP connection for detail view
+    pub selected_connection: Option<TcpConnectionRow>,
+
+    /// Scroll handle for the connections list
+    pub connections_scroll_handle: ScrollHandle,
+
+    /// Currently active tab in connection detail panel
+    pub active_connection_detail_tab: ConnectionDetailTab,
+
+    /// Scroll handle for connection detail panel
+    pub connection_detail_scroll_handle: ScrollHandle,
 }
 
 impl AppState {
@@ -144,6 +204,7 @@ impl AppState {
             clickhouse,
             proxy_running: Arc::new(AtomicBool::new(false)),
             proxy_status: ProxyStatus::Stopped,
+            system_proxy_enabled: false,
             hosts: Vec::new(),
             requests: Vec::new(),
             selected_host: None,
@@ -160,6 +221,15 @@ impl AppState {
             request_list_scroll_handle: ScrollHandle::new(),
             sidebar_scroll_handle: ScrollHandle::new(),
             detail_panel_scroll_handle: ScrollHandle::new(),
+            view_mode: ViewMode::default(),
+            k8s_port_forwards: Vec::new(),
+            k8s_http_routes: Vec::new(),
+            kubernetes_scroll_handle: ScrollHandle::new(),
+            tcp_connections: Vec::new(),
+            selected_connection: None,
+            connections_scroll_handle: ScrollHandle::new(),
+            active_connection_detail_tab: ConnectionDetailTab::default(),
+            connection_detail_scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -194,9 +264,14 @@ impl AppState {
             UiMessage::HostsUpdated(hosts) => {
                 self.hosts = hosts;
             }
+            UiMessage::ConnectionsUpdated(connections) => {
+                self.tcp_connections = connections;
+            }
             UiMessage::ProxyStarted => {
                 self.proxy_status = ProxyStatus::Running;
                 self.error_message = None;
+                // Add sample K8s data when proxy starts for testing
+                self.load_sample_kubernetes_data();
             }
             UiMessage::ProxyFailed(err) => {
                 self.proxy_status = ProxyStatus::Failed(err.clone());
@@ -205,7 +280,74 @@ impl AppState {
             UiMessage::Error(err) => {
                 self.error_message = Some(err);
             }
+            UiMessage::PortForwardsUpdated(forwards) => {
+                self.k8s_port_forwards = forwards;
+            }
+            UiMessage::HttpRoutesUpdated(routes) => {
+                self.k8s_http_routes = routes;
+            }
         }
+    }
+
+    /// Load sample Kubernetes data for testing/demo purposes
+    fn load_sample_kubernetes_data(&mut self) {
+        use crate::components::BackendRef;
+
+        // Sample port forwards (simulating what Roxy would detect)
+        self.k8s_port_forwards = vec![
+            PortForwardInfo {
+                service_dns: "postgres.database.svc.cluster.local".to_string(),
+                namespace: "database".to_string(),
+                service_name: "postgres".to_string(),
+                remote_port: 5432,
+                local_port: 30000,
+                active: true,
+            },
+            PortForwardInfo {
+                service_dns: "kafka.messaging.svc.cluster.local".to_string(),
+                namespace: "messaging".to_string(),
+                service_name: "kafka".to_string(),
+                remote_port: 9092,
+                local_port: 30001,
+                active: true,
+            },
+            PortForwardInfo {
+                service_dns: "config-service.backend.svc.cluster.local".to_string(),
+                namespace: "backend".to_string(),
+                service_name: "config-service".to_string(),
+                remote_port: 8080,
+                local_port: 30002,
+                active: false,
+            },
+        ];
+
+        // Sample HTTP routes (simulating Gateway API HTTPRoute resources)
+        self.k8s_http_routes = vec![
+            HttpRouteInfo {
+                name: "orders-api-route".to_string(),
+                namespace: "backend".to_string(),
+                hostnames: vec!["api.example.com".to_string()],
+                paths: vec!["/api/orders".to_string(), "/orders".to_string()],
+                backends: vec![BackendRef {
+                    name: "orders-api".to_string(),
+                    namespace: Some("backend".to_string()),
+                    port: 3000,
+                    weight: 100,
+                }],
+            },
+            HttpRouteInfo {
+                name: "config-service-route".to_string(),
+                namespace: "backend".to_string(),
+                hostnames: vec!["config.example.com".to_string()],
+                paths: vec!["/config".to_string()],
+                backends: vec![BackendRef {
+                    name: "config-service".to_string(),
+                    namespace: Some("backend".to_string()),
+                    port: 8080,
+                    weight: 100,
+                }],
+            },
+        ];
     }
 
     /// Get the number of captured requests
@@ -287,6 +429,41 @@ impl AppState {
     /// Stop resizing the detail panel
     pub fn stop_resizing_detail_panel(&mut self) {
         self.is_resizing_detail_panel = false;
+    }
+
+    /// Set the current view mode
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        self.view_mode = mode;
+    }
+
+    /// Toggle between Requests and Kubernetes views
+    pub fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Requests => ViewMode::Connections,
+            ViewMode::Connections => ViewMode::Kubernetes,
+            ViewMode::Kubernetes => ViewMode::Requests,
+        };
+    }
+
+    /// Update the Kubernetes port forwards
+    pub fn set_port_forwards(&mut self, forwards: Vec<PortForwardInfo>) {
+        self.k8s_port_forwards = forwards;
+    }
+
+    /// Update the Kubernetes HTTP routes
+    pub fn set_http_routes(&mut self, routes: Vec<HttpRouteInfo>) {
+        self.k8s_http_routes = routes;
+    }
+
+    /// Toggle system proxy on/off
+    /// When enabled, all macOS network traffic goes through Roxy
+    pub fn set_system_proxy_enabled(&mut self, enabled: bool) {
+        self.system_proxy_enabled = enabled;
+    }
+
+    /// Check if system proxy is enabled
+    pub fn is_system_proxy_enabled(&self) -> bool {
+        self.system_proxy_enabled
     }
 }
 

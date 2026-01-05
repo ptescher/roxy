@@ -4,7 +4,10 @@
 //! the Roxy application interface.
 
 mod about_dialog;
+mod connection_detail;
+mod connection_list;
 mod detail_panel;
+mod kubernetes_panel;
 mod request_list;
 mod request_row;
 mod sidebar;
@@ -13,7 +16,15 @@ mod title_bar;
 mod toolbar;
 
 pub use about_dialog::open_about_window;
+pub use connection_detail::{
+    connection_detail_panel, ConnectionDetailPanel, ConnectionDetailPanelProps, ConnectionDetailTab,
+};
+pub use connection_list::{connection_list, ConnectionList, ConnectionListProps};
 pub use detail_panel::{DetailPanel, DetailPanelProps, DetailTab};
+pub use kubernetes_panel::{
+    flow_diagram, http_routes_list, kubernetes_panel, port_forwards_list, BackendRef,
+    HttpRouteInfo, KubernetesPanel, KubernetesPanelProps, PortForwardInfo,
+};
 pub use request_list::{RequestList, RequestListProps};
 pub use sidebar::{Sidebar, SidebarProps};
 pub use status_bar::{StatusBar, StatusBarProps};

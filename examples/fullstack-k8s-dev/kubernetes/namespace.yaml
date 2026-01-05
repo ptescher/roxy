@@ -1,0 +1,33 @@
+# Kubernetes Namespaces for Roxy Example
+#
+# Creates the namespaces used by the example services:
+# - backend: Orders API, Config Service
+# - database: PostgreSQL
+# - messaging: Kafka, Zookeeper
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: roxy-example
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: database
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/part-of: roxy-example
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: messaging
+  labels:
+    app.kubernetes.io/name: messaging
+    app.kubernetes.io/part-of: roxy-example

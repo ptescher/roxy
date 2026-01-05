@@ -19,6 +19,11 @@ pub struct StatusBarProps {
     pub clickhouse_connected: bool,
     /// OpenTelemetry collector status
     pub otel_connected: bool,
+    /// Whether system proxy is enabled (routes all macOS traffic through Roxy)
+    pub system_proxy_enabled: bool,
+    /// Callback when system proxy toggle is clicked
+    pub on_system_proxy_toggle:
+        Option<std::sync::Arc<dyn Fn(bool, &mut App) + Send + Sync + 'static>>,
 }
 
 /// Status bar component
@@ -64,6 +69,7 @@ impl StatusBar {
                 self.props.clickhouse_connected,
             ))
             .child(self.render_service_status("OTel", "127.0.0.1:4317", self.props.otel_connected))
+            .child(self.render_system_proxy_toggle())
     }
 
     /// Render the request count indicator
@@ -109,6 +115,58 @@ impl StatusBar {
                 .child(truncate_error(error, 60)),
             None => div(),
         }
+    }
+
+    /// Render the system proxy toggle
+    fn render_system_proxy_toggle(&self) -> impl IntoElement {
+        let enabled = self.props.system_proxy_enabled;
+        let on_toggle = self.props.on_system_proxy_toggle.clone();
+
+        let bg_color = if enabled {
+            self.theme.success
+        } else {
+            rgb(colors::SURFACE_1).into()
+        };
+        let indicator_color = if enabled {
+            rgb(colors::BASE)
+        } else {
+            self.theme.text_muted.into()
+        };
+        let label = if enabled {
+            "System Proxy: ON"
+        } else {
+            "System Proxy: OFF"
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap(spacing::XS)
+            .cursor_pointer()
+            .child(
+                // Toggle switch
+                div()
+                    .w(px(32.0))
+                    .h(px(16.0))
+                    .rounded(px(8.0))
+                    .bg(bg_color)
+                    .flex()
+                    .items_center()
+                    .px(px(2.0))
+                    .child(
+                        div()
+                            .size(px(12.0))
+                            .rounded(px(6.0))
+                            .bg(indicator_color)
+                            .when(enabled, |d| d.ml(px(14.0))),
+                    ),
+            )
+            .child(label)
+            .when_some(on_toggle, |el, callback| {
+                el.on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                    callback(!enabled, cx);
+                })
+            })
     }
 }
 

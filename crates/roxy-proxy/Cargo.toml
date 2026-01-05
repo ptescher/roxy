@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-description = "Roxy proxy worker - HTTP/SOCKS proxy with OpenTelemetry instrumentation"
+description = "Roxy proxy worker - HTTP forwarding proxy with request logging"
 
 [lib]
 name = "roxy_proxy"
@@ -23,16 +23,10 @@ roxy-core.workspace = true
 tokio.workspace = true
 
 # HTTP/Proxy
-hudsucker.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-rustls.workspace = true
-rcgen.workspace = true
-
-# SOCKS proxy
-fast-socks5 = "0.9"
 
 # OpenTelemetry
 opentelemetry.workspace = true
@@ -57,11 +51,11 @@ chrono.workspace = true
 uuid.workspace = true
 url.workspace = true
 rand.workspace = true
-base64.workspace = true
 
-# macOS system proxy configuration
-[target.'cfg(target_os = "macos")'.dependencies]
-core-foundation = "0.10"
+# Kubernetes
+kube.workspace = true
+k8s-openapi.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["rustls-tls"] }

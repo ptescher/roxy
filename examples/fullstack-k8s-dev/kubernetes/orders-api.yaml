@@ -1,0 +1,184 @@
+# Orders API Deployment for Roxy Example
+#
+# Deploys the NestJS Orders API to Kubernetes.
+# Service DNS: orders-api.backend.svc.cluster.local:3000
+#
+# Prerequisites:
+# 1. Build the Docker image locally:
+#    docker build -t orders-api:latest ./nestjs-api
+#
+# 2. Apply the manifests:
+#    kubectl apply -f kubernetes/
+#
+# Note: imagePullPolicy is set to Never for local K8s (Docker Desktop, minikube)
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orders-api-secrets
+  namespace: backend
+  labels:
+    app: orders-api
+    app.kubernetes.io/part-of: roxy-example
+type: Opaque
+stringData:
+  DATABASE_PASSWORD: password
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-api-config
+  namespace: backend
+  labels:
+    app: orders-api
+    app.kubernetes.io/part-of: roxy-example
+data:
+  NODE_ENV: "production"
+  PORT: "3000"
+  DATABASE_HOST: "postgres.database.svc.cluster.local"
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: "orders"
+  DATABASE_USER: "app"
+  KAFKA_BROKERS: "kafka.messaging.svc.cluster.local:9092"
+  KAFKA_CLIENT_ID: "orders-api"
+  CONFIG_SERVICE_URL: "http://config-service.backend.svc.cluster.local:8080"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  namespace: backend
+  labels:
+    app: orders-api
+    app.kubernetes.io/part-of: roxy-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orders-api
+  template:
+    metadata:
+      labels:
+        app: orders-api
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for PostgreSQL..."
+              until nc -z postgres.database.svc.cluster.local 5432; do
+                sleep 2
+              done
+              echo "PostgreSQL is ready!"
+
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Waiting for Kafka..."
+              until nc -z kafka.messaging.svc.cluster.local 9092; do
+                sleep 2
+              done
+              echo "Kafka is ready!"
+
+      containers:
+        - name: orders-api
+          image: orders-api:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: orders-api-config
+          env:
+            - name: DATABASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: orders-api-secrets
+                  key: DATABASE_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /api/orders/health/dependencies
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/orders/health/dependencies
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-api
+  namespace: backend
+  labels:
+    app: orders-api
+    app.kubernetes.io/part-of: roxy-example
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3000
+      targetPort: 3000
+  selector:
+    app: orders-api
+
+---
+# HTTPRoute for external access to the Orders API
+# This routes traffic from the internet through the Gateway to the orders-api service
+#
+# Example routing:
+#   https://api.example.com/orders/* -> orders-api.backend.svc.cluster.local:3000
+#
+# Prerequisites:
+#   - Gateway API CRDs installed: kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
+#   - A Gateway resource configured in the cluster
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: orders-api-route
+  namespace: backend
+  labels:
+    app: orders-api
+    app.kubernetes.io/part-of: roxy-example
+spec:
+  parentRefs:
+    - name: main-gateway
+      namespace: gateway-system
+  hostnames:
+    - "api.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/orders
+      backendRefs:
+        - name: orders-api
+          port: 3000
+          weight: 100
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /orders
+      backendRefs:
+        - name: orders-api
+          port: 3000
+          weight: 100

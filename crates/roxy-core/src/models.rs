@@ -266,6 +266,323 @@ impl HttpTransaction {
     }
 }
 
+/// Protocol type for database/messaging connections
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProtocolType {
+    /// PostgreSQL wire protocol
+    PostgreSQL,
+    /// Apache Kafka binary protocol
+    Kafka,
+    /// Unknown protocol
+    Unknown,
+}
+
+impl std::fmt::Display for ProtocolType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProtocolType::PostgreSQL => write!(f, "postgresql"),
+            ProtocolType::Kafka => write!(f, "kafka"),
+            ProtocolType::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Database query record for PostgreSQL and other databases
+///
+/// Follows OpenTelemetry semantic conventions for database spans:
+/// https://opentelemetry.io/docs/specs/semconv/database/
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseQueryRecord {
+    /// Unique identifier for this query
+    pub id: Uuid,
+
+    /// OpenTelemetry trace ID
+    pub trace_id: String,
+
+    /// OpenTelemetry span ID
+    pub span_id: String,
+
+    /// Parent span ID (if part of a larger trace)
+    pub parent_span_id: Option<String>,
+
+    /// Timestamp when query started (milliseconds since epoch)
+    pub timestamp: i64,
+
+    /// Duration in milliseconds
+    pub duration_ms: f64,
+
+    /// Database system (e.g., "postgresql")
+    pub db_system: String,
+
+    /// Database name
+    pub db_name: Option<String>,
+
+    /// Database user
+    pub db_user: Option<String>,
+
+    /// Database operation (SELECT, INSERT, UPDATE, DELETE, etc.)
+    pub db_operation: Option<String>,
+
+    /// The SQL statement (sanitized/truncated for large queries)
+    pub db_statement: String,
+
+    /// Number of rows affected/returned
+    pub db_rows_affected: Option<i64>,
+
+    /// Server address (hostname or IP)
+    pub server_address: String,
+
+    /// Server port
+    pub server_port: u16,
+
+    /// Client address
+    pub client_address: String,
+
+    /// Whether the query succeeded
+    pub success: bool,
+
+    /// Error message if query failed
+    pub error_message: Option<String>,
+
+    /// Error code (e.g., SQLSTATE for PostgreSQL)
+    pub error_code: Option<String>,
+
+    /// Application name (if provided in connection)
+    pub application_name: Option<String>,
+
+    /// Additional attributes as JSON
+    pub attributes: String,
+}
+
+impl DatabaseQueryRecord {
+    /// Create a new database query record
+    pub fn new(
+        db_system: &str,
+        db_statement: String,
+        server_address: String,
+        server_port: u16,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            trace_id: format!("{:032x}", rand::random::<u128>()),
+            span_id: format!("{:016x}", rand::random::<u64>()),
+            parent_span_id: None,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            duration_ms: 0.0,
+            db_system: db_system.to_string(),
+            db_name: None,
+            db_user: None,
+            db_operation: None,
+            db_statement,
+            db_rows_affected: None,
+            server_address,
+            server_port,
+            client_address: String::new(),
+            success: true,
+            error_message: None,
+            error_code: None,
+            application_name: None,
+            attributes: "{}".to_string(),
+        }
+    }
+
+    /// Set the database name
+    pub fn with_db_name(mut self, name: &str) -> Self {
+        self.db_name = Some(name.to_string());
+        self
+    }
+
+    /// Set the database user
+    pub fn with_db_user(mut self, user: &str) -> Self {
+        self.db_user = Some(user.to_string());
+        self
+    }
+
+    /// Set the operation type
+    pub fn with_operation(mut self, operation: &str) -> Self {
+        self.db_operation = Some(operation.to_string());
+        self
+    }
+
+    /// Mark as failed with error
+    pub fn with_error(mut self, message: &str, code: Option<&str>) -> Self {
+        self.success = false;
+        self.error_message = Some(message.to_string());
+        self.error_code = code.map(|c| c.to_string());
+        self
+    }
+}
+
+/// Kafka message operation type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KafkaOperation {
+    /// Publishing/producing messages
+    Publish,
+    /// Receiving/consuming messages
+    Receive,
+    /// Processing (consumer group operations, etc.)
+    Process,
+}
+
+impl std::fmt::Display for KafkaOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KafkaOperation::Publish => write!(f, "publish"),
+            KafkaOperation::Receive => write!(f, "receive"),
+            KafkaOperation::Process => write!(f, "process"),
+        }
+    }
+}
+
+/// Kafka message record for message tracing
+///
+/// Follows OpenTelemetry semantic conventions for messaging spans:
+/// https://opentelemetry.io/docs/specs/semconv/messaging/
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KafkaMessageRecord {
+    /// Unique identifier for this message/operation
+    pub id: Uuid,
+
+    /// OpenTelemetry trace ID
+    pub trace_id: String,
+
+    /// OpenTelemetry span ID
+    pub span_id: String,
+
+    /// Parent span ID (if part of a larger trace)
+    pub parent_span_id: Option<String>,
+
+    /// Timestamp when operation started (milliseconds since epoch)
+    pub timestamp: i64,
+
+    /// Duration in milliseconds
+    pub duration_ms: f64,
+
+    /// Messaging system identifier ("kafka")
+    pub messaging_system: String,
+
+    /// Kafka API operation name (e.g., "Produce", "Fetch", "JoinGroup")
+    pub messaging_operation: String,
+
+    /// Operation type (publish, receive, process)
+    pub operation_type: KafkaOperation,
+
+    /// Destination topic name(s) - comma separated if multiple
+    pub messaging_destination: Option<String>,
+
+    /// Consumer group ID (for consumer operations)
+    pub messaging_consumer_group: Option<String>,
+
+    /// Client ID
+    pub messaging_client_id: Option<String>,
+
+    /// Kafka API key (numeric)
+    pub kafka_api_key: i16,
+
+    /// Kafka API version
+    pub kafka_api_version: i16,
+
+    /// Correlation ID for request/response matching
+    pub kafka_correlation_id: i32,
+
+    /// Number of messages in batch (for produce/fetch)
+    pub message_count: Option<i32>,
+
+    /// Total payload size in bytes
+    pub payload_size: Option<i64>,
+
+    /// Server address (broker hostname or IP)
+    pub server_address: String,
+
+    /// Server port
+    pub server_port: u16,
+
+    /// Client address
+    pub client_address: String,
+
+    /// Whether the operation succeeded
+    pub success: bool,
+
+    /// Error code (Kafka error code)
+    pub error_code: Option<i16>,
+
+    /// Error message
+    pub error_message: Option<String>,
+
+    /// Additional attributes as JSON
+    pub attributes: String,
+}
+
+impl KafkaMessageRecord {
+    /// Create a new Kafka message record
+    pub fn new(
+        operation: &str,
+        operation_type: KafkaOperation,
+        api_key: i16,
+        api_version: i16,
+        correlation_id: i32,
+        server_address: String,
+        server_port: u16,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            trace_id: format!("{:032x}", rand::random::<u128>()),
+            span_id: format!("{:016x}", rand::random::<u64>()),
+            parent_span_id: None,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            duration_ms: 0.0,
+            messaging_system: "kafka".to_string(),
+            messaging_operation: operation.to_string(),
+            operation_type,
+            messaging_destination: None,
+            messaging_consumer_group: None,
+            messaging_client_id: None,
+            kafka_api_key: api_key,
+            kafka_api_version: api_version,
+            kafka_correlation_id: correlation_id,
+            message_count: None,
+            payload_size: None,
+            server_address,
+            server_port,
+            client_address: String::new(),
+            success: true,
+            error_code: None,
+            error_message: None,
+            attributes: "{}".to_string(),
+        }
+    }
+
+    /// Set the destination topic(s)
+    pub fn with_destination(mut self, topics: &[String]) -> Self {
+        if !topics.is_empty() {
+            self.messaging_destination = Some(topics.join(","));
+        }
+        self
+    }
+
+    /// Set the consumer group ID
+    pub fn with_consumer_group(mut self, group_id: &str) -> Self {
+        self.messaging_consumer_group = Some(group_id.to_string());
+        self
+    }
+
+    /// Set the client ID
+    pub fn with_client_id(mut self, client_id: &str) -> Self {
+        self.messaging_client_id = Some(client_id.to_string());
+        self
+    }
+
+    /// Mark as failed with error
+    pub fn with_error(mut self, code: i16, message: Option<&str>) -> Self {
+        self.success = false;
+        self.error_code = Some(code);
+        self.error_message = message.map(|m| m.to_string());
+        self
+    }
+}
+
 impl HttpRequest {
     /// Create a new request with a generated ID
     pub fn new(method: HttpMethod, url: String) -> Self {

@@ -63,9 +63,31 @@ Roxy is a modern alternative to tools like Proxyman or Charles Proxy. It interce
 |-----------|-------------|------|
 | `roxy` (UI) | Native macOS application, spawns and manages the proxy | - |
 | `roxy-proxy` | HTTP/HTTPS proxy with TLS interception | 8080 |
+| `roxy-proxy` | SOCKS5 proxy for TCP connections (PostgreSQL, Kafka, etc.) | 1080 |
 | `roxy-core` | Shared library: types, service management, auto-updater | - |
 | ClickHouse | Time-series database (auto-managed subprocess) | 8123, 9000 |
 | OTel Collector | Telemetry processing (auto-managed subprocess) | 4317, 4318 |
+
+### SOCKS5 Proxy for TCP Connections
+
+Roxy includes a SOCKS5 proxy (port 1080) for handling non-HTTP TCP connections like PostgreSQL, Kafka, Redis, etc. When a connection is made to a Kubernetes service DNS name (e.g., `postgres.database.svc.cluster.local`), Roxy will:
+
+1. **Parse the K8s DNS name** - Extract service name and namespace
+2. **Start kubectl port-forward** - Automatically create a port-forward to the K8s service
+3. **Route the connection** - Forward the TCP connection through the port-forward
+
+This allows your local applications to connect to Kubernetes services using their DNS names without manual port-forward setup.
+
+**Usage with Node.js/TypeScript:**
+
+```bash
+# Set environment variable to route TCP through Roxy's SOCKS5 proxy
+SOCKS5_PROXY=socks5://127.0.0.1:1080 npm run start:dev
+```
+
+**Supported DNS formats:**
+- `service.namespace.svc.cluster.local` (full format)
+- `service.namespace.svc` (short format)
 
 ### How It Works
 
@@ -77,9 +99,12 @@ When you launch Roxy:
    - Downloads binaries for your platform from GitHub releases
    - Generates configuration files in `~/.roxy/config/`
 4. **Proxy starts services** - launches ClickHouse and OTel as subprocesses
-5. **Proxy begins intercepting** - listens on port 8080 for HTTP/HTTPS traffic
-6. **UI polls ClickHouse** - displays captured requests in real-time
-7. **On quit** - everything shuts down gracefully in reverse order
+5. **Proxy begins intercepting**:
+   - HTTP/HTTPS proxy on port 8080
+   - SOCKS5 proxy on port 1080 (for TCP connections)
+6. **Automatic K8s forwarding** - SOCKS5 connections to `*.svc.cluster.local` addresses trigger automatic `kubectl port-forward`
+7. **UI polls ClickHouse** - displays captured requests in real-time
+8. **On quit** - everything shuts down gracefully in reverse order (including kubectl port-forwards)
 
 All data is stored locally in `~/.roxy/`.
 
@@ -595,10 +620,12 @@ For code signing and notarization (required for distribution), set these environ
 - [x] Routing rule data model
 - [x] Kubernetes port-forward data model
 - [ ] Routing rule evaluation engine
-- [ ] OpenTelemetry span creation for traced requests
-- [ ] Store captured requests in ClickHouse via otel collector
+- [x] OpenTelemetry span creation for traced requests
+- [x] Store captured requests in ClickHouse via otel collector
 - [ ] SOCKS5 proxy support
-- [ ] Kubernetes service discovery
+- [x] Kubernetes service discovery
+- [ ] PostgreSQL instrumentation
+- [ ] Kafka instrumentation
 - [ ] OpenAPI schema awareness
 - [ ] Request/response modification
 - [ ] Breakpoints and debugging
