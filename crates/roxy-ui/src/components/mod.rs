@@ -6,9 +6,13 @@
 mod about_dialog;
 mod connection_detail;
 mod connection_list;
+mod database_detail;
+mod database_list;
 mod detail_panel;
 mod kubernetes_panel;
 mod left_dock;
+mod messaging_detail;
+mod messaging_list;
 mod node_graph;
 mod request_list;
 mod request_row;
@@ -22,6 +26,10 @@ pub use connection_detail::{
     connection_detail_panel, ConnectionDetailPanel, ConnectionDetailPanelProps, ConnectionDetailTab,
 };
 pub use connection_list::{connection_list, ConnectionList, ConnectionListProps};
+pub use database_detail::{
+    database_detail_panel, DatabaseDetailPanel, DatabaseDetailPanelProps, DatabaseDetailTab,
+};
+pub use database_list::{database_list, DatabaseList, DatabaseListProps};
 pub use detail_panel::{DetailPanel, DetailPanelProps, DetailTab};
 pub use kubernetes_panel::{
     flow_diagram, http_routes_list, kubernetes_panel, port_forwards_list, BackendRef,
@@ -32,6 +40,10 @@ pub use kubernetes_panel::{
 pub use left_dock::{
     left_dock, KubeContext, KubeNamespace, LeftDock, LeftDockProps, LeftDockTab, ServiceSummary,
 };
+pub use messaging_detail::{
+    messaging_detail_panel, MessagingDetailPanel, MessagingDetailPanelProps, MessagingDetailTab,
+};
+pub use messaging_list::{messaging_list, MessagingList, MessagingListProps};
 pub use node_graph::{
     node_graph, EdgeStyle, GraphEdge, GraphLayout, GraphNode, NodeGraph, NodeGraphBuilder, NodeId,
 };

@@ -872,22 +872,21 @@ fn parse_string(data: &[u8], offset: &mut usize) -> Option<String> {
 }
 
 /// Parse a compact string (varint length, for newer API versions)
-#[allow(dead_code)]
 fn parse_compact_string(data: &[u8], offset: &mut usize) -> Option<String> {
-    // Compact strings use unsigned varint for length
-    // For simplicity, we'll handle the common case of small strings
-    if data.len() < *offset + 1 {
-        return None;
-    }
+    // Compact strings use unsigned varint for length, encoded as actual_length + 1
+    // So 0 would be invalid (use nullable for that), 1 = empty string, n = n-1 bytes
+    let len_encoded = parse_unsigned_varint(data, offset)?;
 
-    let len_byte = data[*offset];
-    *offset += 1;
-
-    if len_byte == 0 {
+    if len_encoded == 0 {
+        // This shouldn't happen for non-nullable compact strings
         return Some(String::new());
     }
 
-    let len = (len_byte - 1) as usize; // Length is encoded as actual_length + 1
+    let len = (len_encoded - 1) as usize;
+
+    if len == 0 {
+        return Some(String::new());
+    }
 
     if data.len() < *offset + len {
         return None;
@@ -898,21 +897,69 @@ fn parse_compact_string(data: &[u8], offset: &mut usize) -> Option<String> {
     s
 }
 
+/// Parse a compact nullable string (varint length, 0 = null)
+fn parse_compact_nullable_string(data: &[u8], offset: &mut usize) -> Option<Option<String>> {
+    let len_encoded = parse_unsigned_varint(data, offset)?;
+
+    if len_encoded == 0 {
+        return Some(None); // null string
+    }
+
+    let len = (len_encoded - 1) as usize;
+
+    if len == 0 {
+        return Some(Some(String::new()));
+    }
+
+    if data.len() < *offset + len {
+        return None;
+    }
+
+    let s = String::from_utf8(data[*offset..*offset + len].to_vec()).ok();
+    *offset += len;
+    Some(s)
+}
+
+/// Parse an unsigned varint (used in flexible versions)
+fn parse_unsigned_varint(data: &[u8], offset: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+
+    loop {
+        if *offset >= data.len() {
+            return None;
+        }
+
+        let byte = data[*offset];
+        *offset += 1;
+
+        result |= ((byte & 0x7F) as u64) << shift;
+
+        if byte & 0x80 == 0 {
+            break;
+        }
+
+        shift += 7;
+        if shift >= 64 {
+            return None; // Overflow protection
+        }
+    }
+
+    Some(result)
+}
+
 /// Parse produce request
-fn parse_produce_request(data: &[u8], _api_version: i16) -> RequestDetails {
-    // Skip transactional_id (nullable string) for v3+
-    // Skip acks (i16)
-    // Skip timeout (i32)
+fn parse_produce_request(data: &[u8], api_version: i16) -> RequestDetails {
+    // Kafka Produce request format varies by version:
+    // - v0-2: acks (2) + timeout (4) + topic_array
+    // - v3-8: transactional_id (nullable string) + acks (2) + timeout (4) + topic_array
+    // - v9+: flexible version with compact strings and tagged fields
 
-    // For simplicity, we'll try to extract topic names
     let mut topics = Vec::new();
-    let mut offset;
+    let mut offset = 0;
+    let is_flexible = api_version >= 9;
 
-    // Skip to topic array - this varies by version
-    // Version 0-2: acks (2) + timeout (4) + topic_count (4)
-    // Version 3+: transactional_id (variable) + acks (2) + timeout (4) + topic_count (4)
-
-    if data.len() < 8 {
+    if data.len() < 6 {
         return RequestDetails::Produce(ProduceRequest {
             acks: 0,
             timeout_ms: 0,
@@ -921,37 +968,96 @@ fn parse_produce_request(data: &[u8], _api_version: i16) -> RequestDetails {
         });
     }
 
-    let acks = i16::from_be_bytes([data[0], data[1]]);
-    let timeout_ms = i32::from_be_bytes([data[2], data[3], data[4], data[5]]);
-    offset = 6;
+    // For v3+, skip transactional_id first
+    if api_version >= 3 {
+        if is_flexible {
+            // Compact nullable string: length as unsigned varint, 0 = null, 1 = empty, n = n-1 bytes
+            if let Some(_) = parse_compact_nullable_string(data, &mut offset) {
+                // Successfully skipped transactional_id
+            }
+        } else {
+            // Regular nullable string
+            let _ = parse_string(data, &mut offset);
+        }
+    }
 
-    // Try to parse topic array
-    if data.len() >= offset + 4 {
-        let topic_count = i32::from_be_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]);
-        offset += 4;
+    if data.len() < offset + 6 {
+        return RequestDetails::Produce(ProduceRequest {
+            acks: 0,
+            timeout_ms: 0,
+            topics,
+            message_count: None,
+        });
+    }
 
-        for _ in 0..topic_count.min(100) {
-            // Limit to prevent runaway parsing
-            if let Some(topic) = parse_string(data, &mut offset) {
-                topics.push(topic);
-                // Skip partition data
-                if data.len() >= offset + 4 {
-                    let _partition_count = i32::from_be_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                    ]) as usize;
-                    // Skip partition entries (complex, just break out)
+    let acks = i16::from_be_bytes([data[offset], data[offset + 1]]);
+    offset += 2;
+    let timeout_ms = i32::from_be_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]);
+    offset += 4;
+
+    // Parse topic array
+    if is_flexible {
+        // Compact array: length as unsigned varint (actual_length + 1, so 0 = null, 1 = empty)
+        if let Some(topic_count) = parse_unsigned_varint(data, &mut offset) {
+            let actual_count = if topic_count > 0 { topic_count - 1 } else { 0 };
+            for _ in 0..actual_count.min(100) {
+                if let Some(topic) = parse_compact_string(data, &mut offset) {
+                    topics.push(topic);
+                    // Skip partition data - compact array of partitions
+                    if let Some(partition_count) = parse_unsigned_varint(data, &mut offset) {
+                        let actual_partitions = if partition_count > 0 {
+                            partition_count - 1
+                        } else {
+                            0
+                        };
+                        // Skip partition entries (complex structure, break after getting topic names)
+                        for _ in 0..actual_partitions {
+                            // Each partition: index (4) + records (variable) + tagged_fields
+                            if data.len() > offset + 4 {
+                                offset += 4; // partition index
+                                             // Skip the rest - too complex to parse fully
+                                break;
+                            }
+                        }
+                    }
+                } else {
                     break;
                 }
-            } else {
-                break;
+            }
+        }
+    } else {
+        // Regular array with 4-byte length prefix
+        if data.len() >= offset + 4 {
+            let topic_count = i32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            offset += 4;
+
+            for _ in 0..topic_count.min(100) {
+                if let Some(topic) = parse_string(data, &mut offset) {
+                    topics.push(topic);
+                    // Skip partition data
+                    if data.len() >= offset + 4 {
+                        let _partition_count = i32::from_be_bytes([
+                            data[offset],
+                            data[offset + 1],
+                            data[offset + 2],
+                            data[offset + 3],
+                        ]) as usize;
+                        // Skip partition entries (complex, just break out after getting topics)
+                        break;
+                    }
+                } else {
+                    break;
+                }
             }
         }
     }

@@ -4,9 +4,9 @@
 //! the application state, UI messages, and proxy status.
 
 use crate::components::{
-    ConnectionDetailTab, DetailTab, HttpRouteInfo, K8sBackendRef, K8sGateway, K8sGatewayListener,
-    K8sHttpRoute, K8sIngress, K8sParentRef, K8sService, K8sServicePort, KubeContext, KubeNamespace,
-    LeftDockTab, PortForwardInfo, ServiceSummary,
+    ConnectionDetailTab, DatabaseDetailTab, DetailTab, HttpRouteInfo, K8sBackendRef, K8sGateway,
+    K8sGatewayListener, K8sHttpRoute, K8sIngress, K8sParentRef, K8sService, K8sServicePort,
+    KubeContext, KubeNamespace, LeftDockTab, MessagingDetailTab, PortForwardInfo, ServiceSummary,
 };
 use gpui::ScrollHandle;
 use k8s_openapi::api::core::v1::{Namespace, Service};
@@ -16,7 +16,8 @@ use kube::config::Kubeconfig;
 use kube::discovery::ApiResource;
 use kube::{Api, Client, Config};
 use roxy_core::{
-    ClickHouseConfig, HostSummary, HttpRequestRecord, RoxyClickHouse, TcpConnectionRow,
+    ClickHouseConfig, DatabaseQueryRow, HostSummary, HttpRequestRecord, KafkaMessageRow,
+    RoxyClickHouse, TcpConnectionRow,
 };
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -107,8 +108,12 @@ pub enum ViewMode {
     /// Show HTTP requests
     #[default]
     Requests,
-    /// Show TCP connections (PostgreSQL, Kafka, etc.)
-    Connections,
+    /// Show database queries (PostgreSQL, MySQL, etc.)
+    Database,
+    /// Show messaging (Kafka, RabbitMQ, etc.)
+    Messaging,
+    /// Show raw TCP connections (unknown protocols)
+    TCP,
     /// Show Kubernetes overview
     Kubernetes,
 }
@@ -117,7 +122,9 @@ impl ViewMode {
     pub fn label(&self) -> &'static str {
         match self {
             ViewMode::Requests => "HTTP",
-            ViewMode::Connections => "Connections",
+            ViewMode::Database => "Database",
+            ViewMode::Messaging => "Messaging",
+            ViewMode::TCP => "TCP",
             ViewMode::Kubernetes => "Kubernetes",
         }
     }
@@ -132,6 +139,10 @@ pub enum UiMessage {
     HostsUpdated(Vec<HostSummary>),
     /// New TCP connections fetched from ClickHouse
     ConnectionsUpdated(Vec<TcpConnectionRow>),
+    /// New database queries fetched from ClickHouse
+    DatabaseQueriesUpdated(Vec<DatabaseQueryRow>),
+    /// New Kafka messages fetched from ClickHouse
+    KafkaMessagesUpdated(Vec<KafkaMessageRow>),
     /// Proxy server started successfully
     ProxyStarted,
     /// Proxy server failed to start
@@ -293,20 +304,50 @@ pub struct AppState {
     /// Scroll handle for the Kubernetes panel
     pub kubernetes_scroll_handle: ScrollHandle,
 
-    /// List of recent TCP connections (PostgreSQL, Kafka, etc.)
+    /// List of recent TCP connections (unknown protocols only)
     pub tcp_connections: Vec<TcpConnectionRow>,
+
+    /// List of recent database queries (PostgreSQL, MySQL, etc.)
+    pub database_queries: Vec<DatabaseQueryRow>,
+
+    /// List of recent Kafka/messaging records
+    pub kafka_messages: Vec<KafkaMessageRow>,
 
     /// Currently selected TCP connection for detail view
     pub selected_connection: Option<TcpConnectionRow>,
 
+    /// Currently selected database query for detail view
+    pub selected_database_query: Option<DatabaseQueryRow>,
+
+    /// Currently selected Kafka message for detail view
+    pub selected_kafka_message: Option<KafkaMessageRow>,
+
     /// Scroll handle for the connections list
     pub connections_scroll_handle: ScrollHandle,
+
+    /// Scroll handle for the database query list
+    pub database_list_scroll_handle: ScrollHandle,
+
+    /// Scroll handle for the messaging list
+    pub messaging_list_scroll_handle: ScrollHandle,
 
     /// Currently active tab in connection detail panel
     pub active_connection_detail_tab: ConnectionDetailTab,
 
+    /// Currently active tab in database detail panel
+    pub active_database_detail_tab: DatabaseDetailTab,
+
+    /// Currently active tab in messaging detail panel
+    pub active_messaging_detail_tab: MessagingDetailTab,
+
     /// Scroll handle for connection detail panel
     pub connection_detail_scroll_handle: ScrollHandle,
+
+    /// Scroll handle for database detail panel
+    pub database_detail_scroll_handle: ScrollHandle,
+
+    /// Scroll handle for messaging detail panel
+    pub messaging_detail_scroll_handle: ScrollHandle,
 
     // =========================================================================
     // Left Dock State
@@ -381,10 +422,20 @@ impl AppState {
             k8s_http_routes_legacy: Vec::new(),
             kubernetes_scroll_handle: ScrollHandle::new(),
             tcp_connections: Vec::new(),
+            database_queries: Vec::new(),
+            kafka_messages: Vec::new(),
             selected_connection: None,
+            selected_database_query: None,
+            selected_kafka_message: None,
             connections_scroll_handle: ScrollHandle::new(),
+            database_list_scroll_handle: ScrollHandle::new(),
+            messaging_list_scroll_handle: ScrollHandle::new(),
             active_connection_detail_tab: ConnectionDetailTab::default(),
+            active_database_detail_tab: DatabaseDetailTab::default(),
+            active_messaging_detail_tab: MessagingDetailTab::default(),
             connection_detail_scroll_handle: ScrollHandle::new(),
+            database_detail_scroll_handle: ScrollHandle::new(),
+            messaging_detail_scroll_handle: ScrollHandle::new(),
             // Left dock state
             left_dock_tab: LeftDockTab::default(),
             services: Vec::new(),
@@ -433,6 +484,12 @@ impl AppState {
             }
             UiMessage::ConnectionsUpdated(connections) => {
                 self.tcp_connections = connections;
+            }
+            UiMessage::DatabaseQueriesUpdated(queries) => {
+                self.database_queries = queries;
+            }
+            UiMessage::KafkaMessagesUpdated(messages) => {
+                self.kafka_messages = messages;
             }
             UiMessage::ProxyStarted => {
                 self.proxy_status = ProxyStatus::Running;
@@ -574,11 +631,13 @@ impl AppState {
         self.view_mode = mode;
     }
 
-    /// Toggle between Requests and Kubernetes views
+    /// Toggle between view modes
     pub fn toggle_view_mode(&mut self) {
         self.view_mode = match self.view_mode {
-            ViewMode::Requests => ViewMode::Connections,
-            ViewMode::Connections => ViewMode::Kubernetes,
+            ViewMode::Requests => ViewMode::Database,
+            ViewMode::Database => ViewMode::Messaging,
+            ViewMode::Messaging => ViewMode::TCP,
+            ViewMode::TCP => ViewMode::Kubernetes,
             ViewMode::Kubernetes => ViewMode::Requests,
         };
     }
