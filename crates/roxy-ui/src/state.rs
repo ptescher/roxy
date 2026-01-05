@@ -3,14 +3,103 @@
 //! This module contains the core state management types including
 //! the application state, UI messages, and proxy status.
 
-use crate::components::{ConnectionDetailTab, DetailTab, HttpRouteInfo, PortForwardInfo};
+use crate::components::{
+    ConnectionDetailTab, DetailTab, HttpRouteInfo, K8sBackendRef, K8sGateway, K8sGatewayListener,
+    K8sHttpRoute, K8sIngress, K8sParentRef, K8sService, K8sServicePort, KubeContext, KubeNamespace,
+    LeftDockTab, PortForwardInfo, ServiceSummary,
+};
 use gpui::ScrollHandle;
+use k8s_openapi::api::core::v1::{Namespace, Service};
+use k8s_openapi::api::networking::v1::Ingress;
+use kube::api::{DynamicObject, GroupVersionKind};
+use kube::config::Kubeconfig;
+use kube::discovery::ApiResource;
+use kube::{Api, Client, Config};
 use roxy_core::{
     ClickHouseConfig, HostSummary, HttpRequestRecord, RoxyClickHouse, TcpConnectionRow,
 };
+use serde::Deserialize;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+
+// =============================================================================
+// Port Forwards Config File
+// =============================================================================
+
+/// Port forwards configuration file format
+#[derive(Debug, Clone, Deserialize)]
+struct PortForwardsConfig {
+    port_forwards: Vec<PortForwardEntry>,
+}
+
+/// A single port forward entry in the config file
+#[derive(Debug, Clone, Deserialize)]
+struct PortForwardEntry {
+    name: String,
+    namespace: String,
+    service: String,
+    remote_port: u16,
+    local_port: u16,
+    #[serde(default)]
+    auto_start: bool,
+}
+
+impl From<PortForwardEntry> for PortForwardInfo {
+    fn from(entry: PortForwardEntry) -> Self {
+        Self {
+            service_dns: format!("{}.{}.svc.cluster.local", entry.service, entry.namespace),
+            namespace: entry.namespace,
+            service_name: entry.service,
+            remote_port: entry.remote_port,
+            local_port: entry.local_port,
+            active: entry.auto_start,
+        }
+    }
+}
+
+/// Load port forwards from config file
+///
+/// Searches for config in:
+/// 1. ~/.roxy/port-forwards.yaml
+/// 2. ./roxy-config/port-forwards.yaml (for development)
+pub fn load_port_forwards_config() -> Vec<PortForwardInfo> {
+    let config_paths = [
+        dirs::home_dir().map(|h| h.join(".roxy").join("port-forwards.yaml")),
+        Some(PathBuf::from("roxy-config/port-forwards.yaml")),
+        Some(PathBuf::from(
+            "examples/fullstack-k8s-dev/roxy-config/port-forwards.yaml",
+        )),
+    ];
+
+    for path in config_paths.iter().flatten() {
+        if path.exists() {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => match serde_yaml::from_str::<PortForwardsConfig>(&contents) {
+                    Ok(config) => {
+                        info!(
+                            "Loaded {} port forwards from {:?}",
+                            config.port_forwards.len(),
+                            path
+                        );
+                        return config.port_forwards.into_iter().map(Into::into).collect();
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse port forwards config {:?}: {}", path, e);
+                    }
+                },
+                Err(e) => {
+                    debug!("Could not read {:?}: {}", path, e);
+                }
+            }
+        }
+    }
+
+    debug!("No port forwards config file found");
+    Vec::new()
+}
 
 /// The main view mode for the application
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,6 +142,20 @@ pub enum UiMessage {
     PortForwardsUpdated(Vec<PortForwardInfo>),
     /// Kubernetes HTTP routes updated
     HttpRoutesUpdated(Vec<HttpRouteInfo>),
+    /// Kubernetes namespaces loaded
+    KubeNamespacesLoaded(Vec<KubeNamespace>),
+    /// Kubernetes services loaded
+    KubeServicesLoaded(Vec<K8sService>),
+    /// Kubernetes ingresses loaded
+    KubeIngressesLoaded(Vec<K8sIngress>),
+    /// Kubernetes Gateways loaded (Gateway API)
+    KubeGatewaysLoaded(Vec<K8sGateway>),
+    /// Kubernetes HTTPRoutes loaded
+    KubeHttpRoutesLoaded(Vec<K8sHttpRoute>),
+    /// Kubernetes resources loading complete
+    KubeLoadingComplete,
+    /// Kubernetes client failed to initialize
+    KubeClientFailed(String),
 }
 
 /// Proxy server status
@@ -169,11 +272,23 @@ pub struct AppState {
     /// Current view mode (Requests or Kubernetes)
     pub view_mode: ViewMode,
 
-    /// Active Kubernetes port forwards
+    /// Kubernetes Ingress resources
+    pub k8s_ingresses: Vec<K8sIngress>,
+
+    /// Kubernetes Gateway resources (Gateway API)
+    pub k8s_gateways: Vec<K8sGateway>,
+
+    /// Kubernetes HTTPRoute resources (Gateway API)
+    pub k8s_http_routes: Vec<K8sHttpRoute>,
+
+    /// Kubernetes Services
+    pub k8s_services: Vec<K8sService>,
+
+    /// Active Kubernetes port forwards from Roxy
     pub k8s_port_forwards: Vec<PortForwardInfo>,
 
-    /// Kubernetes HTTP routes
-    pub k8s_http_routes: Vec<HttpRouteInfo>,
+    /// Legacy HTTP routes (kept for compatibility)
+    pub k8s_http_routes_legacy: Vec<HttpRouteInfo>,
 
     /// Scroll handle for the Kubernetes panel
     pub kubernetes_scroll_handle: ScrollHandle,
@@ -192,6 +307,42 @@ pub struct AppState {
 
     /// Scroll handle for connection detail panel
     pub connection_detail_scroll_handle: ScrollHandle,
+
+    // =========================================================================
+    // Left Dock State
+    // =========================================================================
+    /// Currently active tab in the left dock
+    pub left_dock_tab: LeftDockTab,
+
+    /// List of connected services/apps
+    pub services: Vec<ServiceSummary>,
+
+    /// Currently selected service filter
+    pub selected_service: Option<String>,
+
+    /// Scroll handle for services list
+    pub services_scroll_handle: ScrollHandle,
+
+    /// Available Kubernetes contexts
+    pub kube_contexts: Vec<KubeContext>,
+
+    /// Currently selected Kubernetes context
+    pub selected_kube_context: Option<String>,
+
+    /// Kubernetes namespaces for the selected context
+    pub kube_namespaces: Vec<KubeNamespace>,
+
+    /// Currently selected namespace (None = all namespaces)
+    pub selected_kube_namespace: Option<String>,
+
+    /// Scroll handle for kubernetes namespace list in left dock
+    pub kube_namespaces_scroll_handle: ScrollHandle,
+
+    /// Whether the context dropdown in the Kubernetes tab is expanded
+    pub context_dropdown_expanded: bool,
+
+    /// Whether Kubernetes resources are currently loading
+    pub kube_loading: bool,
 }
 
 impl AppState {
@@ -222,14 +373,30 @@ impl AppState {
             sidebar_scroll_handle: ScrollHandle::new(),
             detail_panel_scroll_handle: ScrollHandle::new(),
             view_mode: ViewMode::default(),
-            k8s_port_forwards: Vec::new(),
+            k8s_ingresses: Vec::new(),
+            k8s_gateways: Vec::new(),
             k8s_http_routes: Vec::new(),
+            k8s_services: Vec::new(),
+            k8s_port_forwards: load_port_forwards_config(),
+            k8s_http_routes_legacy: Vec::new(),
             kubernetes_scroll_handle: ScrollHandle::new(),
             tcp_connections: Vec::new(),
             selected_connection: None,
             connections_scroll_handle: ScrollHandle::new(),
             active_connection_detail_tab: ConnectionDetailTab::default(),
             connection_detail_scroll_handle: ScrollHandle::new(),
+            // Left dock state
+            left_dock_tab: LeftDockTab::default(),
+            services: Vec::new(),
+            selected_service: None,
+            services_scroll_handle: ScrollHandle::new(),
+            kube_contexts: Vec::new(),
+            selected_kube_context: None,
+            kube_namespaces: Vec::new(),
+            selected_kube_namespace: None,
+            kube_namespaces_scroll_handle: ScrollHandle::new(),
+            context_dropdown_expanded: false,
+            kube_loading: false,
         }
     }
 
@@ -270,8 +437,6 @@ impl AppState {
             UiMessage::ProxyStarted => {
                 self.proxy_status = ProxyStatus::Running;
                 self.error_message = None;
-                // Add sample K8s data when proxy starts for testing
-                self.load_sample_kubernetes_data();
             }
             UiMessage::ProxyFailed(err) => {
                 self.proxy_status = ProxyStatus::Failed(err.clone());
@@ -284,70 +449,33 @@ impl AppState {
                 self.k8s_port_forwards = forwards;
             }
             UiMessage::HttpRoutesUpdated(routes) => {
+                self.k8s_http_routes_legacy = routes;
+            }
+            UiMessage::KubeNamespacesLoaded(namespaces) => {
+                self.kube_namespaces = namespaces;
+            }
+            UiMessage::KubeServicesLoaded(services) => {
+                self.k8s_services = services;
+            }
+            UiMessage::KubeIngressesLoaded(ingresses) => {
+                self.k8s_ingresses = ingresses;
+            }
+            UiMessage::KubeGatewaysLoaded(gateways) => {
+                self.k8s_gateways = gateways;
+            }
+            UiMessage::KubeHttpRoutesLoaded(routes) => {
                 self.k8s_http_routes = routes;
             }
+            UiMessage::KubeLoadingComplete => {
+                self.kube_loading = false;
+                debug!("Kubernetes resources loaded");
+            }
+            UiMessage::KubeClientFailed(err) => {
+                self.kube_loading = false;
+                self.error_message = Some(format!("Kubernetes: {}", err));
+                warn!("Kubernetes client failed: {}", err);
+            }
         }
-    }
-
-    /// Load sample Kubernetes data for testing/demo purposes
-    fn load_sample_kubernetes_data(&mut self) {
-        use crate::components::BackendRef;
-
-        // Sample port forwards (simulating what Roxy would detect)
-        self.k8s_port_forwards = vec![
-            PortForwardInfo {
-                service_dns: "postgres.database.svc.cluster.local".to_string(),
-                namespace: "database".to_string(),
-                service_name: "postgres".to_string(),
-                remote_port: 5432,
-                local_port: 30000,
-                active: true,
-            },
-            PortForwardInfo {
-                service_dns: "kafka.messaging.svc.cluster.local".to_string(),
-                namespace: "messaging".to_string(),
-                service_name: "kafka".to_string(),
-                remote_port: 9092,
-                local_port: 30001,
-                active: true,
-            },
-            PortForwardInfo {
-                service_dns: "config-service.backend.svc.cluster.local".to_string(),
-                namespace: "backend".to_string(),
-                service_name: "config-service".to_string(),
-                remote_port: 8080,
-                local_port: 30002,
-                active: false,
-            },
-        ];
-
-        // Sample HTTP routes (simulating Gateway API HTTPRoute resources)
-        self.k8s_http_routes = vec![
-            HttpRouteInfo {
-                name: "orders-api-route".to_string(),
-                namespace: "backend".to_string(),
-                hostnames: vec!["api.example.com".to_string()],
-                paths: vec!["/api/orders".to_string(), "/orders".to_string()],
-                backends: vec![BackendRef {
-                    name: "orders-api".to_string(),
-                    namespace: Some("backend".to_string()),
-                    port: 3000,
-                    weight: 100,
-                }],
-            },
-            HttpRouteInfo {
-                name: "config-service-route".to_string(),
-                namespace: "backend".to_string(),
-                hostnames: vec!["config.example.com".to_string()],
-                paths: vec!["/config".to_string()],
-                backends: vec![BackendRef {
-                    name: "config-service".to_string(),
-                    namespace: Some("backend".to_string()),
-                    port: 8080,
-                    weight: 100,
-                }],
-            },
-        ];
     }
 
     /// Get the number of captured requests
@@ -411,13 +539,23 @@ impl AppState {
         self.detail_panel_height = height.clamp(MIN_DETAIL_PANEL_HEIGHT, MAX_DETAIL_PANEL_HEIGHT);
     }
 
-    /// Start resizing the sidebar
+    /// Start resizing the sidebar/left dock
     pub fn start_resizing_sidebar(&mut self) {
         self.is_resizing_sidebar = true;
     }
 
-    /// Stop resizing the sidebar
+    /// Stop resizing the sidebar/left dock
     pub fn stop_resizing_sidebar(&mut self) {
+        self.is_resizing_sidebar = false;
+    }
+
+    /// Start resizing the left dock (alias for sidebar)
+    pub fn start_resizing_left_dock(&mut self) {
+        self.is_resizing_sidebar = true;
+    }
+
+    /// Stop resizing the left dock (alias for sidebar)
+    pub fn stop_resizing_left_dock(&mut self) {
         self.is_resizing_sidebar = false;
     }
 
@@ -450,20 +588,140 @@ impl AppState {
         self.k8s_port_forwards = forwards;
     }
 
-    /// Update the Kubernetes HTTP routes
+    /// Update the Kubernetes HTTP routes (legacy)
     pub fn set_http_routes(&mut self, routes: Vec<HttpRouteInfo>) {
-        self.k8s_http_routes = routes;
+        self.k8s_http_routes_legacy = routes;
     }
 
     /// Toggle system proxy on/off
-    /// When enabled, all macOS network traffic goes through Roxy
     pub fn set_system_proxy_enabled(&mut self, enabled: bool) {
         self.system_proxy_enabled = enabled;
     }
 
-    /// Check if system proxy is enabled
     pub fn is_system_proxy_enabled(&self) -> bool {
         self.system_proxy_enabled
+    }
+
+    // =========================================================================
+    // Left Dock Methods
+    // =========================================================================
+
+    /// Set the active left dock tab
+    pub fn set_left_dock_tab(&mut self, tab: LeftDockTab) {
+        self.left_dock_tab = tab;
+    }
+
+    /// Select a service to filter by
+    pub fn select_service(&mut self, service: String) {
+        self.selected_service = Some(service);
+    }
+
+    /// Clear the service filter
+    pub fn clear_service_filter(&mut self) {
+        self.selected_service = None;
+    }
+
+    /// Set the selected Kubernetes context and reload resources
+    pub fn select_kube_context(&mut self, context: String) {
+        self.selected_kube_context = Some(context.clone());
+        // Clear namespace selection when context changes
+        self.selected_kube_namespace = None;
+        // Clear existing resources
+        self.kube_namespaces.clear();
+        self.k8s_services.clear();
+        self.k8s_ingresses.clear();
+        self.k8s_http_routes.clear();
+        // Start loading
+        self.kube_loading = true;
+        // Spawn background thread with its own tokio runtime to load resources
+        let tx = self.message_tx.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            rt.block_on(load_kubernetes_resources(context, None, tx));
+        });
+    }
+
+    /// Toggle the context dropdown expanded state
+    pub fn toggle_context_dropdown(&mut self) {
+        self.context_dropdown_expanded = !self.context_dropdown_expanded;
+    }
+
+    /// Set the selected Kubernetes namespace and reload namespace-specific resources
+    pub fn select_kube_namespace(&mut self, namespace: Option<String>) {
+        self.selected_kube_namespace = namespace.clone();
+
+        // Reload resources for the new namespace
+        if let Some(context) = self.selected_kube_context.clone() {
+            let tx = self.message_tx.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                rt.block_on(load_namespace_resources(context, namespace, tx));
+            });
+        }
+    }
+
+    /// Load Kubernetes contexts from the system kubeconfig
+    pub fn load_kube_contexts(&mut self) {
+        // Try to load kubeconfig from default location (~/.kube/config)
+        match Kubeconfig::read() {
+            Ok(kubeconfig) => {
+                let current_context = kubeconfig.current_context.as_deref();
+                debug!(
+                    "Loaded kubeconfig with {} contexts, current: {:?}",
+                    kubeconfig.contexts.len(),
+                    current_context
+                );
+
+                self.kube_contexts = kubeconfig
+                    .contexts
+                    .iter()
+                    .map(|named_ctx| {
+                        let ctx = &named_ctx.context.as_ref();
+                        let cluster_name = ctx
+                            .map(|c| c.cluster.clone())
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        KubeContext {
+                            name: named_ctx.name.clone(),
+                            is_current: current_context == Some(named_ctx.name.as_str()),
+                            cluster: cluster_name,
+                        }
+                    })
+                    .collect();
+
+                // Auto-select the current context and load its resources
+                if let Some(current) = current_context {
+                    self.selected_kube_context = Some(current.to_string());
+                    self.kube_loading = true;
+                    let tx = self.message_tx.clone();
+                    let context = current.to_string();
+                    std::thread::spawn(move || {
+                        let rt =
+                            tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                        rt.block_on(load_kubernetes_resources(context, None, tx));
+                    });
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load kubeconfig: {}", e);
+                // Leave contexts empty - user can see there's no k8s config
+                self.kube_contexts = Vec::new();
+                self.selected_kube_context = None;
+            }
+        }
+    }
+
+    /// Refresh Kubernetes resources for the current context and namespace
+    pub fn refresh_kubernetes_resources(&mut self) {
+        if let Some(context) = self.selected_kube_context.clone() {
+            self.kube_loading = true;
+            let namespace = self.selected_kube_namespace.clone();
+            let tx = self.message_tx.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                rt.block_on(load_kubernetes_resources(context, namespace, tx));
+            });
+        }
     }
 }
 
@@ -472,6 +730,487 @@ impl Default for AppState {
         Self::new()
     }
 }
+
+// =============================================================================
+// Kubernetes Loading Functions
+// =============================================================================
+
+/// Create a Kubernetes client for a specific context
+async fn create_kube_client(context_name: &str) -> Result<Client, String> {
+    let kubeconfig = Kubeconfig::read().map_err(|e| format!("Failed to read kubeconfig: {}", e))?;
+
+    let config = Config::from_custom_kubeconfig(
+        kubeconfig,
+        &kube::config::KubeConfigOptions {
+            context: Some(context_name.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|e| format!("Failed to create config: {}", e))?;
+
+    Client::try_from(config).map_err(|e| format!("Failed to create client: {}", e))
+}
+
+/// Load all Kubernetes resources for a context
+async fn load_kubernetes_resources(
+    context: String,
+    namespace: Option<String>,
+    tx: mpsc::UnboundedSender<UiMessage>,
+) {
+    info!(
+        "Loading Kubernetes resources for context: {}, namespace: {:?}",
+        context, namespace
+    );
+
+    let client = match create_kube_client(&context).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to create Kubernetes client: {}", e);
+            let _ = tx.send(UiMessage::KubeClientFailed(e));
+            return;
+        }
+    };
+
+    // Load namespaces first
+    if let Err(e) = load_namespaces(&client, &tx).await {
+        warn!("Failed to load namespaces: {}", e);
+    }
+
+    // Load namespace-scoped resources
+    load_namespace_resources_with_client(&client, namespace, &tx).await;
+
+    let _ = tx.send(UiMessage::KubeLoadingComplete);
+}
+
+/// Load namespace-specific resources (services, ingresses, routes)
+async fn load_namespace_resources(
+    context: String,
+    namespace: Option<String>,
+    tx: mpsc::UnboundedSender<UiMessage>,
+) {
+    let client = match create_kube_client(&context).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to create Kubernetes client: {}", e);
+            let _ = tx.send(UiMessage::KubeClientFailed(e));
+            return;
+        }
+    };
+
+    load_namespace_resources_with_client(&client, namespace, &tx).await;
+}
+
+/// Load namespace-specific resources using an existing client
+async fn load_namespace_resources_with_client(
+    client: &Client,
+    namespace: Option<String>,
+    tx: &mpsc::UnboundedSender<UiMessage>,
+) {
+    // Load services
+    if let Err(e) = load_services(client, namespace.as_deref(), tx).await {
+        warn!("Failed to load services: {}", e);
+    }
+
+    // Load ingresses
+    if let Err(e) = load_ingresses(client, namespace.as_deref(), tx).await {
+        warn!("Failed to load ingresses: {}", e);
+    }
+
+    // Load Gateway API resources (Gateways and HTTPRoutes)
+    // These are CRDs, so we use dynamic API and gracefully handle if they don't exist
+    if let Err(e) = load_gateways(client, namespace.as_deref(), tx).await {
+        debug!("Failed to load Gateways (CRD may not be installed): {}", e);
+    }
+
+    if let Err(e) = load_http_routes(client, namespace.as_deref(), tx).await {
+        debug!(
+            "Failed to load HTTPRoutes (CRD may not be installed): {}",
+            e
+        );
+    }
+}
+
+/// Load Kubernetes namespaces
+async fn load_namespaces(
+    client: &Client,
+    tx: &mpsc::UnboundedSender<UiMessage>,
+) -> Result<(), kube::Error> {
+    let namespaces_api: Api<Namespace> = Api::all(client.clone());
+    let namespaces = namespaces_api.list(&Default::default()).await?;
+
+    let mut kube_namespaces = Vec::new();
+
+    for ns in namespaces.items {
+        let name = ns.metadata.name.unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+
+        // Get service count for this namespace
+        let services_api: Api<Service> = Api::namespaced(client.clone(), &name);
+        let service_count = services_api
+            .list(&Default::default())
+            .await
+            .map(|list| list.items.len())
+            .unwrap_or(0);
+
+        kube_namespaces.push(KubeNamespace {
+            name,
+            service_count: service_count as u32,
+            pod_count: 0, // Skip pod count to avoid extra API calls
+        });
+    }
+
+    // Sort: user namespaces first (alphabetically), then system namespaces
+    kube_namespaces.sort_by(|a, b| {
+        let a_system = a.name.starts_with("kube-") || a.name == "default";
+        let b_system = b.name.starts_with("kube-") || b.name == "default";
+        match (a_system, b_system) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => a.name.cmp(&b.name),
+        }
+    });
+
+    debug!("Loaded {} namespaces", kube_namespaces.len());
+    let _ = tx.send(UiMessage::KubeNamespacesLoaded(kube_namespaces));
+
+    Ok(())
+}
+
+/// Load Kubernetes services
+async fn load_services(
+    client: &Client,
+    namespace: Option<&str>,
+    tx: &mpsc::UnboundedSender<UiMessage>,
+) -> Result<(), kube::Error> {
+    let services: Vec<Service> = match namespace {
+        Some(ns) => {
+            let api: Api<Service> = Api::namespaced(client.clone(), ns);
+            api.list(&Default::default()).await?.items
+        }
+        None => {
+            let api: Api<Service> = Api::all(client.clone());
+            api.list(&Default::default()).await?.items
+        }
+    };
+
+    let k8s_services: Vec<K8sService> = services
+        .into_iter()
+        .filter_map(|svc| {
+            let metadata = svc.metadata;
+            let spec = svc.spec?;
+
+            let name = metadata.name?;
+            let namespace = metadata.namespace.unwrap_or_else(|| "default".to_string());
+
+            let ports: Vec<K8sServicePort> = spec
+                .ports
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| {
+                    let target_port = p
+                        .target_port
+                        .map(|tp| match tp {
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(i) => {
+                                i as u16
+                            }
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(
+                                _,
+                            ) => p.port as u16,
+                        })
+                        .unwrap_or(p.port as u16);
+
+                    K8sServicePort {
+                        name: p.name,
+                        port: p.port as u16,
+                        target_port,
+                        protocol: p.protocol.unwrap_or_else(|| "TCP".to_string()),
+                    }
+                })
+                .collect();
+
+            Some(K8sService {
+                name,
+                namespace,
+                service_type: spec.type_.unwrap_or_else(|| "ClusterIP".to_string()),
+                ports,
+                ready_endpoints: 0, // Would need to query Endpoints resource
+                total_endpoints: 0,
+            })
+        })
+        .collect();
+
+    debug!("Loaded {} services", k8s_services.len());
+    let _ = tx.send(UiMessage::KubeServicesLoaded(k8s_services));
+
+    Ok(())
+}
+
+/// Load Kubernetes ingresses
+async fn load_ingresses(
+    client: &Client,
+    namespace: Option<&str>,
+    tx: &mpsc::UnboundedSender<UiMessage>,
+) -> Result<(), kube::Error> {
+    let ingresses: Vec<Ingress> = match namespace {
+        Some(ns) => {
+            let api: Api<Ingress> = Api::namespaced(client.clone(), ns);
+            api.list(&Default::default()).await?.items
+        }
+        None => {
+            let api: Api<Ingress> = Api::all(client.clone());
+            api.list(&Default::default()).await?.items
+        }
+    };
+
+    let k8s_ingresses: Vec<K8sIngress> = ingresses
+        .into_iter()
+        .filter_map(|ing| {
+            let metadata = ing.metadata;
+            let spec = ing.spec?;
+
+            let name = metadata.name?;
+            let namespace = metadata.namespace.unwrap_or_else(|| "default".to_string());
+
+            // Extract hosts from rules
+            let hosts: Vec<String> = spec
+                .rules
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|rule| rule.host)
+                .collect();
+
+            let ingress_class = spec.ingress_class_name;
+
+            Some(K8sIngress {
+                name,
+                namespace,
+                hosts,
+                ingress_class,
+            })
+        })
+        .collect();
+
+    debug!("Loaded {} ingresses", k8s_ingresses.len());
+    let _ = tx.send(UiMessage::KubeIngressesLoaded(k8s_ingresses));
+
+    Ok(())
+}
+
+/// Load Kubernetes Gateway resources (Gateway API)
+async fn load_gateways(
+    client: &Client,
+    namespace: Option<&str>,
+    tx: &mpsc::UnboundedSender<UiMessage>,
+) -> Result<(), kube::Error> {
+    let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "Gateway");
+    let api_resource = ApiResource::from_gvk(&gvk);
+
+    let gateways: Vec<DynamicObject> = match namespace {
+        Some(ns) => {
+            let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &api_resource);
+            api.list(&Default::default()).await?.items
+        }
+        None => {
+            let api: Api<DynamicObject> = Api::all_with(client.clone(), &api_resource);
+            api.list(&Default::default()).await?.items
+        }
+    };
+
+    let k8s_gateways: Vec<K8sGateway> = gateways
+        .into_iter()
+        .filter_map(|gw| {
+            let name = gw.metadata.name?;
+            let namespace = gw
+                .metadata
+                .namespace
+                .unwrap_or_else(|| "default".to_string());
+
+            let spec = gw.data.get("spec")?.as_object()?;
+            let gateway_class = spec
+                .get("gatewayClassName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let listeners: Vec<K8sGatewayListener> = spec
+                .get("listeners")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|l| {
+                            let obj = l.as_object()?;
+                            Some(K8sGatewayListener {
+                                name: obj.get("name")?.as_str()?.to_string(),
+                                hostname: obj
+                                    .get("hostname")
+                                    .and_then(|h| h.as_str())
+                                    .map(|s| s.to_string()),
+                                port: obj.get("port")?.as_u64()? as u16,
+                                protocol: obj.get("protocol")?.as_str()?.to_string(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Some(K8sGateway {
+                name,
+                namespace,
+                gateway_class,
+                listeners,
+            })
+        })
+        .collect();
+
+    debug!("Loaded {} gateways", k8s_gateways.len());
+    let _ = tx.send(UiMessage::KubeGatewaysLoaded(k8s_gateways));
+
+    Ok(())
+}
+
+/// Load Kubernetes HTTPRoute resources (Gateway API)
+async fn load_http_routes(
+    client: &Client,
+    namespace: Option<&str>,
+    tx: &mpsc::UnboundedSender<UiMessage>,
+) -> Result<(), kube::Error> {
+    let gvk = GroupVersionKind::gvk("gateway.networking.k8s.io", "v1", "HTTPRoute");
+    let api_resource = ApiResource::from_gvk(&gvk);
+
+    let routes: Vec<DynamicObject> = match namespace {
+        Some(ns) => {
+            let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), ns, &api_resource);
+            api.list(&Default::default()).await?.items
+        }
+        None => {
+            let api: Api<DynamicObject> = Api::all_with(client.clone(), &api_resource);
+            api.list(&Default::default()).await?.items
+        }
+    };
+
+    let k8s_routes: Vec<K8sHttpRoute> = routes
+        .into_iter()
+        .filter_map(|route| {
+            let name = route.metadata.name?;
+            let namespace = route
+                .metadata
+                .namespace
+                .unwrap_or_else(|| "default".to_string());
+
+            let spec = route.data.get("spec")?.as_object()?;
+
+            // Extract hostnames
+            let hostnames: Vec<String> = spec
+                .get("hostnames")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|h| h.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Extract parent refs (which Gateways this route attaches to)
+            let parent_refs: Vec<K8sParentRef> = spec
+                .get("parentRefs")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| {
+                            let obj = p.as_object()?;
+                            Some(K8sParentRef {
+                                name: obj.get("name")?.as_str()?.to_string(),
+                                namespace: obj
+                                    .get("namespace")
+                                    .and_then(|n| n.as_str())
+                                    .map(|s| s.to_string()),
+                                section_name: obj
+                                    .get("sectionName")
+                                    .and_then(|s| s.as_str())
+                                    .map(|s| s.to_string()),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Extract paths and backend refs from rules
+            let rules = spec.get("rules").and_then(|v| v.as_array())?;
+            let mut paths: Vec<String> = Vec::new();
+            let mut backend_refs: Vec<K8sBackendRef> = Vec::new();
+
+            for rule in rules {
+                let rule_obj = rule.as_object()?;
+
+                // Extract paths from matches
+                if let Some(matches) = rule_obj.get("matches").and_then(|m| m.as_array()) {
+                    for m in matches {
+                        if let Some(path) = m
+                            .as_object()
+                            .and_then(|o| o.get("path"))
+                            .and_then(|p| p.as_object())
+                        {
+                            if let Some(value) = path.get("value").and_then(|v| v.as_str()) {
+                                paths.push(value.to_string());
+                            }
+                        }
+                    }
+                }
+
+                // Extract backend refs
+                if let Some(backends) = rule_obj.get("backendRefs").and_then(|b| b.as_array()) {
+                    for backend in backends {
+                        if let Some(obj) = backend.as_object() {
+                            let svc_name = obj
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let svc_ns = obj
+                                .get("namespace")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| namespace.clone());
+                            let port =
+                                obj.get("port").and_then(|p| p.as_u64()).unwrap_or(80) as u16;
+                            let weight =
+                                obj.get("weight").and_then(|w| w.as_u64()).map(|w| w as u32);
+
+                            if !svc_name.is_empty() {
+                                backend_refs.push(K8sBackendRef {
+                                    service_name: svc_name,
+                                    namespace: svc_ns,
+                                    port,
+                                    weight,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some(K8sHttpRoute {
+                name,
+                namespace,
+                hostnames,
+                paths,
+                parent_refs,
+                backend_refs,
+            })
+        })
+        .collect();
+
+    debug!("Loaded {} HTTP routes", k8s_routes.len());
+    let _ = tx.send(UiMessage::KubeHttpRoutesLoaded(k8s_routes));
+
+    Ok(())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

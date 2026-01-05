@@ -8,6 +8,8 @@ mod connection_detail;
 mod connection_list;
 mod detail_panel;
 mod kubernetes_panel;
+mod left_dock;
+mod node_graph;
 mod request_list;
 mod request_row;
 mod sidebar;
@@ -23,7 +25,15 @@ pub use connection_list::{connection_list, ConnectionList, ConnectionListProps};
 pub use detail_panel::{DetailPanel, DetailPanelProps, DetailTab};
 pub use kubernetes_panel::{
     flow_diagram, http_routes_list, kubernetes_panel, port_forwards_list, BackendRef,
-    HttpRouteInfo, KubernetesPanel, KubernetesPanelProps, PortForwardInfo,
+    HttpRouteInfo, K8sBackendRef, K8sGateway, K8sGatewayListener, K8sHttpRoute, K8sIngress,
+    K8sParentRef, K8sService, K8sServicePort, KubernetesPanel, KubernetesPanelProps,
+    PortForwardInfo,
+};
+pub use left_dock::{
+    left_dock, KubeContext, KubeNamespace, LeftDock, LeftDockProps, LeftDockTab, ServiceSummary,
+};
+pub use node_graph::{
+    node_graph, EdgeStyle, GraphEdge, GraphLayout, GraphNode, NodeGraph, NodeGraphBuilder, NodeId,
 };
 pub use request_list::{RequestList, RequestListProps};
 pub use sidebar::{Sidebar, SidebarProps};

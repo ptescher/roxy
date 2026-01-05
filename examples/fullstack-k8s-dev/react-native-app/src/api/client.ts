@@ -14,7 +14,9 @@ import Constants from "expo-constants";
 
 // In development, talk directly to local NestJS server
 // In production, this would be your actual API URL
-const API_BASE_URL = __DEV__ ? "http://localhost:3000" : (Constants.expoConfig?.extra?.apiBaseUrl || "https://api.example.app");
+const API_BASE_URL = __DEV__
+  ? "http://localhost:3000"
+  : Constants.expoConfig?.extra?.apiBaseUrl || "https://api.example.app";
 
 /**
  * Order item
@@ -93,6 +95,25 @@ export interface DependencyHealth {
 }
 
 /**
+ * Transform order response to ensure numeric fields are numbers.
+ * TypeORM returns decimal columns as strings from PostgreSQL.
+ */
+function transformOrder(order: any): Order {
+  return {
+    ...order,
+    subtotal: parseFloat(order.subtotal) || 0,
+    tax: parseFloat(order.tax) || 0,
+    total: parseFloat(order.total) || 0,
+    items:
+      order.items?.map((item: any) => ({
+        ...item,
+        unitPrice: parseFloat(item.unitPrice) || 0,
+        discount: item.discount ? parseFloat(item.discount) : undefined,
+      })) || [],
+  };
+}
+
+/**
  * API Client
  */
 class ApiClient {
@@ -114,7 +135,7 @@ class ApiClient {
 
   async createOrder(order: CreateOrderRequest): Promise<Order> {
     const response = await this.client.post<Order>("/api/orders", order);
-    return response.data;
+    return transformOrder(response.data);
   }
 
   async getOrders(params?: {
@@ -124,22 +145,25 @@ class ApiClient {
     offset?: number;
   }): Promise<{ orders: Order[]; total: number }> {
     const response = await this.client.get<{ orders: Order[]; total: number }>("/api/orders", { params });
-    return response.data;
+    return {
+      ...response.data,
+      orders: response.data.orders.map(transformOrder),
+    };
   }
 
   async getOrder(orderId: string): Promise<Order> {
     const response = await this.client.get<Order>(`/api/orders/${orderId}`);
-    return response.data;
+    return transformOrder(response.data);
   }
 
   async confirmOrder(orderId: string): Promise<Order> {
     const response = await this.client.post<Order>(`/api/orders/${orderId}/confirm`);
-    return response.data;
+    return transformOrder(response.data);
   }
 
   async cancelOrder(orderId: string, reason?: string): Promise<Order> {
     const response = await this.client.post<Order>(`/api/orders/${orderId}/cancel`, { reason });
-    return response.data;
+    return transformOrder(response.data);
   }
 
   async getOrderStats(): Promise<OrderStats> {

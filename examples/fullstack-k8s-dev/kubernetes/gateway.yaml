@@ -1,0 +1,79 @@
+# Gateway API Resources for Roxy Example
+#
+# Provides the Gateway API infrastructure for routing external traffic
+# to backend services via HTTPRoutes.
+#
+# Prerequisites:
+#   Install Gateway API CRDs:
+#   kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+#
+# Note: For production, you'd use a Gateway controller like:
+#   - Envoy Gateway: https://gateway.envoyproxy.io/
+#   - NGINX Gateway Fabric: https://github.com/nginxinc/nginx-gateway-fabric
+#   - Traefik: https://doc.traefik.io/traefik/routing/providers/kubernetes-gateway/
+#
+# For local development (Docker Desktop/minikube), the Gateway resource
+# will be created but won't route traffic without a controller.
+# Roxy can still visualize the intended traffic flow.
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gateway-system
+  labels:
+    app.kubernetes.io/name: gateway-system
+    app.kubernetes.io/part-of: roxy-example
+
+---
+# Gateway defines the entry point for external traffic
+# HTTPRoutes attach to this Gateway via parentRefs
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: main-gateway
+  namespace: gateway-system
+  labels:
+    app.kubernetes.io/part-of: roxy-example
+spec:
+  # GatewayClass depends on which controller you're using
+  # Common options: envoy, nginx, traefik, istio
+  # For visualization purposes, we use a placeholder
+  gatewayClassName: example-gateway-class
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "*.example.com"
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.example.com"
+      allowedRoutes:
+        namespaces:
+          from: All
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: example-tls
+            kind: Secret
+
+---
+# Placeholder TLS secret for the HTTPS listener
+# In production, use cert-manager or provide real certificates
+apiVersion: v1
+kind: Secret
+metadata:
+  name: example-tls
+  namespace: gateway-system
+  labels:
+    app.kubernetes.io/part-of: roxy-example
+type: kubernetes.io/tls
+data:
+  # Self-signed placeholder (base64 encoded)
+  # Generate real certs for production use
+  tls.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUI0VENDQVlhZ0F3SUJBZ0lVSEdLQmFIb3dYWUxxRmdMdUNqRzFUV0JjS0Fnd0NnWUlLb1pJemowRUF3SXcKUlRFTE1Ba0dBMVVFQmhNQ1FWVXhFekFSQmdOVkJBZ01DbE52YldVdFUzUmhkR1V4SVRBZkJnTlZCQW9NR0VsdQpkR1Z5Ym1WMElGZHBaR2RwZEhNZ1VIUjVJRXgwWkRBZUZ3MHlOREF4TURFeE1qQXdNREJhRncweU5UQXhNREV4Ck1qQXdNREJhTUVVeEN6QUpCZ05WQkFZVEFrRlZNUk13RVFZRFZRUUlEQXBUYjIxbExWTjBZWFJsTVNFd0h3WUQKVlFRS0RCaEpiblJsY201bGRDQlhhV1JuYVhSeklGQjBlU0JNZEdRd1dUQVRCZ2NxaGtqT1BRSUJCZ2dxaGtqTwpQUU1CQndOQ0FBUUZLejR5WVRxVGtKT3B0RGdkYUdZcHVXR0RnU0hLblFOaXhlWUxVQ2VLZE9RY3BtSjVDT3RqClpVbXJZYVFNSnpjQnB0WG10K05aV1JxMk5qMmFLQUhUbzFNd1VUQWRCZ05WSFE0RUZnUVVtN3hLaktIYUVPQVEKSWdZRno5a3ZhbFlLNE9Bd0h3WURWUjBqQkJnd0ZvQVVtN3hLaktIYUVPQVFJZ1lGejlrdmFsWUs0T0F3RHdZRApWUjBUQVFIL0JBVXdBd0VCL3pBS0JnZ3Foa2pPUFFRREFnTkpBREJHQWlFQXdGNGdYcnR4Y0hQRTBEVEtPems4CnRQZEZNbnFKRmd0WXdHTG1FQnNTZWxNQ0lRQ1d6VWxOZy9wRG9UTjZEUmVMV3h5a0c2QWNGbktMQWVJYW5mNkoKMlppbEFnPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
+  tls.key: LS0tLS1CRUdJTiBFQyBQUklWQVRFIEtFWS0tLS0tCk1IUUNBUUVFSURvU3JMK0hCZnZPY2V0Smd2OEhRTFRPVVlIK2dxOU0wNnRZRWVEWFk4czRvQWNHQlN1QkJBQUsKb1VRRFFnQUVCU3MrTW1FNms1Q1RxYlE0SFdobUtibGhnNEVoeXAwRFlzWG1DMUF1aW5Ua0hLWmllUWpyWTJWSgpxMkdrRENjM0FhYlY1cmZqV1ZrYXRqWTltaWdCMHc9PQotLS0tLUVORCBFQyBQUklWQVRFIEtFWS0tLS0tCg==

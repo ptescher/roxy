@@ -24,6 +24,10 @@ roxy-proxy = { path = "../roxy-proxy" }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
+
+# Directories
+dirs = "5.0"
 
 # Error handling
 anyhow = { workspace = true }
@@ -41,6 +45,10 @@ url = { workspace = true }
 smallvec = "1.13"
 parking_lot = "0.12"
 futures = "0.3"
+
+# Kubernetes
+kube = { version = "0.98", features = ["client", "config"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
 
 # macOS specific
 [target.'cfg(target_os = "macos")'.dependencies]
