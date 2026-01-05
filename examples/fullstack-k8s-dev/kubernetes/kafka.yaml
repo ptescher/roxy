@@ -1,0 +1,94 @@
+# Kafka for Roxy Example
+#
+# Deploys Kafka to Kubernetes using KRaft mode (no Zookeeper required).
+# Service DNS: kafka.messaging.svc.cluster.local:9092
+#
+# When running locally with Roxy and HTTP_PROXY, connections to this
+# K8s DNS address are automatically port-forwarded to the cluster.
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-config
+  namespace: messaging
+  labels:
+    app: kafka
+    app.kubernetes.io/part-of: roxy-example
+data:
+  # KRaft mode configuration (no Zookeeper needed)
+  KAFKA_NODE_ID: "1"
+  KAFKA_PROCESS_ROLES: "broker,controller"
+  KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+  KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka.messaging.svc.cluster.local:9092"
+  KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+  KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+  KAFKA_NUM_PARTITIONS: "3"
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+  CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: messaging
+  labels:
+    app: kafka
+    app.kubernetes.io/part-of: roxy-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9092
+              name: plaintext
+            - containerPort: 9093
+              name: controller
+          envFrom:
+            - configMapRef:
+                name: kafka-config
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: messaging
+  labels:
+    app: kafka
+    app.kubernetes.io/part-of: roxy-example
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9092
+      targetPort: 9092
+      name: plaintext
+  selector:
+    app: kafka

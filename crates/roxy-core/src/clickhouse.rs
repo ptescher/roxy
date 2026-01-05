@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use clickhouse::{Client, Row};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// Escape a string for safe use in ClickHouse SQL queries
 fn escape_string(s: &str) -> String {
@@ -99,6 +100,27 @@ impl RoxyClickHouse {
             .execute()
             .await
             .context("Failed to create hosts_summary view")?;
+
+        // Create database queries table
+        self.client
+            .query(DATABASE_QUERIES_TABLE_SCHEMA)
+            .execute()
+            .await
+            .context("Failed to create database_queries table")?;
+
+        // Create kafka messages table
+        self.client
+            .query(KAFKA_MESSAGES_TABLE_SCHEMA)
+            .execute()
+            .await
+            .context("Failed to create kafka_messages table")?;
+
+        // Create TCP connections table for raw packet tracking
+        self.client
+            .query(TCP_CONNECTIONS_TABLE_SCHEMA)
+            .execute()
+            .await
+            .context("Failed to create tcp_connections table")?;
 
         tracing::info!("ClickHouse schema initialized successfully");
         Ok(())
@@ -251,6 +273,259 @@ impl RoxyClickHouse {
             .await?;
         Ok(requests.into_iter().next())
     }
+
+    /// Insert a database query record
+    pub async fn insert_database_query(&self, record: &DatabaseQueryRow) -> Result<()> {
+        let query = format!(
+            r"INSERT INTO database_queries (
+                id, trace_id, span_id, parent_span_id, timestamp, duration_ms,
+                db_system, db_name, db_user, db_operation, db_statement, db_rows_affected,
+                server_address, server_port, client_address, success,
+                error_message, error_code, application_name, attributes
+            ) VALUES (
+                '{id}', '{trace_id}', '{span_id}', '{parent_span_id}', {timestamp}, {duration_ms},
+                '{db_system}', '{db_name}', '{db_user}', '{db_operation}', '{db_statement}', {db_rows_affected},
+                '{server_address}', {server_port}, '{client_address}', {success},
+                '{error_message}', '{error_code}', '{application_name}', '{attributes}'
+            )",
+            id = record.id,
+            trace_id = escape_string(&record.trace_id),
+            span_id = escape_string(&record.span_id),
+            parent_span_id = escape_string(&record.parent_span_id),
+            timestamp = record.timestamp,
+            duration_ms = record.duration_ms,
+            db_system = escape_string(&record.db_system),
+            db_name = escape_string(&record.db_name),
+            db_user = escape_string(&record.db_user),
+            db_operation = escape_string(&record.db_operation),
+            db_statement = escape_string(&record.db_statement),
+            db_rows_affected = record.db_rows_affected,
+            server_address = escape_string(&record.server_address),
+            server_port = record.server_port,
+            client_address = escape_string(&record.client_address),
+            success = record.success,
+            error_message = escape_string(&record.error_message),
+            error_code = escape_string(&record.error_code),
+            application_name = escape_string(&record.application_name),
+            attributes = escape_string(&record.attributes),
+        );
+
+        self.client
+            .query(&query)
+            .execute()
+            .await
+            .context("Failed to insert database query")?;
+
+        Ok(())
+    }
+
+    /// Insert a Kafka message record
+    pub async fn insert_kafka_message(&self, record: &KafkaMessageRow) -> Result<()> {
+        let query = format!(
+            r"INSERT INTO kafka_messages (
+                id, trace_id, span_id, parent_span_id, timestamp, duration_ms,
+                messaging_system, messaging_operation, operation_type,
+                messaging_destination, messaging_consumer_group, messaging_client_id,
+                kafka_api_key, kafka_api_version, kafka_correlation_id,
+                message_count, payload_size, server_address, server_port, client_address,
+                success, error_code, error_message, attributes
+            ) VALUES (
+                '{id}', '{trace_id}', '{span_id}', '{parent_span_id}', {timestamp}, {duration_ms},
+                '{messaging_system}', '{messaging_operation}', '{operation_type}',
+                '{messaging_destination}', '{messaging_consumer_group}', '{messaging_client_id}',
+                {kafka_api_key}, {kafka_api_version}, {kafka_correlation_id},
+                {message_count}, {payload_size}, '{server_address}', {server_port}, '{client_address}',
+                {success}, {error_code}, '{error_message}', '{attributes}'
+            )",
+            id = record.id,
+            trace_id = escape_string(&record.trace_id),
+            span_id = escape_string(&record.span_id),
+            parent_span_id = escape_string(&record.parent_span_id),
+            timestamp = record.timestamp,
+            duration_ms = record.duration_ms,
+            messaging_system = escape_string(&record.messaging_system),
+            messaging_operation = escape_string(&record.messaging_operation),
+            operation_type = escape_string(&record.operation_type),
+            messaging_destination = escape_string(&record.messaging_destination),
+            messaging_consumer_group = escape_string(&record.messaging_consumer_group),
+            messaging_client_id = escape_string(&record.messaging_client_id),
+            kafka_api_key = record.kafka_api_key,
+            kafka_api_version = record.kafka_api_version,
+            kafka_correlation_id = record.kafka_correlation_id,
+            message_count = record.message_count,
+            payload_size = record.payload_size,
+            server_address = escape_string(&record.server_address),
+            server_port = record.server_port,
+            client_address = escape_string(&record.client_address),
+            success = record.success,
+            error_code = record.error_code,
+            error_message = escape_string(&record.error_message),
+            attributes = escape_string(&record.attributes),
+        );
+
+        self.client
+            .query(&query)
+            .execute()
+            .await
+            .context("Failed to insert Kafka message")?;
+
+        Ok(())
+    }
+
+    /// Query recent database queries
+    pub async fn get_recent_database_queries(&self, limit: u32) -> Result<Vec<DatabaseQueryRow>> {
+        let queries = self
+            .client
+            .query("SELECT * FROM database_queries ORDER BY timestamp DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all::<DatabaseQueryRow>()
+            .await?;
+        Ok(queries)
+    }
+
+    /// Query recent Kafka messages
+    pub async fn get_recent_kafka_messages(&self, limit: u32) -> Result<Vec<KafkaMessageRow>> {
+        let messages = self
+            .client
+            .query("SELECT * FROM kafka_messages ORDER BY timestamp DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all::<KafkaMessageRow>()
+            .await?;
+        Ok(messages)
+    }
+
+    /// Query database queries by db_system (e.g., "postgresql")
+    pub async fn get_database_queries_by_system(
+        &self,
+        db_system: &str,
+        limit: u32,
+    ) -> Result<Vec<DatabaseQueryRow>> {
+        let queries = self
+            .client
+            .query("SELECT * FROM database_queries WHERE db_system = ? ORDER BY timestamp DESC LIMIT ?")
+            .bind(db_system)
+            .bind(limit)
+            .fetch_all::<DatabaseQueryRow>()
+            .await?;
+        Ok(queries)
+    }
+
+    /// Query Kafka messages by topic
+    pub async fn get_kafka_messages_by_topic(
+        &self,
+        topic: &str,
+        limit: u32,
+    ) -> Result<Vec<KafkaMessageRow>> {
+        let messages = self
+            .client
+            .query("SELECT * FROM kafka_messages WHERE messaging_destination LIKE ? ORDER BY timestamp DESC LIMIT ?")
+            .bind(format!("%{}%", topic))
+            .bind(limit)
+            .fetch_all::<KafkaMessageRow>()
+            .await?;
+        Ok(messages)
+    }
+
+    /// Insert a TCP connection record
+    pub async fn insert_tcp_connection(&self, record: &TcpConnectionRow) -> Result<()> {
+        let query = format!(
+            r"INSERT INTO tcp_connections (
+                id, trace_id, span_id, timestamp, duration_ms,
+                protocol, protocol_detected, wire_detected,
+                client_address, client_port, server_address, server_port,
+                target_host, bytes_sent, bytes_received,
+                client_messages, server_messages, parse_errors,
+                initial_bytes_hex, initial_bytes_ascii, sample_request_hex, sample_response_hex,
+                status, error_message, attributes
+            ) VALUES (
+                '{id}', '{trace_id}', '{span_id}', {timestamp}, {duration_ms},
+                '{protocol}', '{protocol_detected}', {wire_detected},
+                '{client_address}', {client_port}, '{server_address}', {server_port},
+                '{target_host}', {bytes_sent}, {bytes_received},
+                {client_messages}, {server_messages}, {parse_errors},
+                '{initial_bytes_hex}', '{initial_bytes_ascii}', '{sample_request_hex}', '{sample_response_hex}',
+                '{status}', '{error_message}', '{attributes}'
+            )",
+            id = record.id,
+            trace_id = escape_string(&record.trace_id),
+            span_id = escape_string(&record.span_id),
+            timestamp = record.timestamp,
+            duration_ms = record.duration_ms,
+            protocol = escape_string(&record.protocol),
+            protocol_detected = escape_string(&record.protocol_detected),
+            wire_detected = record.wire_detected,
+            client_address = escape_string(&record.client_address),
+            client_port = record.client_port,
+            server_address = escape_string(&record.server_address),
+            server_port = record.server_port,
+            target_host = escape_string(&record.target_host),
+            bytes_sent = record.bytes_sent,
+            bytes_received = record.bytes_received,
+            client_messages = record.client_messages,
+            server_messages = record.server_messages,
+            parse_errors = record.parse_errors,
+            initial_bytes_hex = escape_string(&record.initial_bytes_hex),
+            initial_bytes_ascii = escape_string(&record.initial_bytes_ascii),
+            sample_request_hex = escape_string(&record.sample_request_hex),
+            sample_response_hex = escape_string(&record.sample_response_hex),
+            status = escape_string(&record.status),
+            error_message = escape_string(&record.error_message),
+            attributes = escape_string(&record.attributes),
+        );
+
+        self.client
+            .query(&query)
+            .execute()
+            .await
+            .context("Failed to insert TCP connection")?;
+
+        Ok(())
+    }
+
+    /// Query recent TCP connections (all protocols)
+    pub async fn get_recent_connections(&self, limit: u32) -> Result<Vec<TcpConnectionRow>> {
+        let connections = self
+            .client
+            .query("SELECT * FROM tcp_connections ORDER BY timestamp DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all::<TcpConnectionRow>()
+            .await?;
+        Ok(connections)
+    }
+
+    /// Query TCP connections by protocol
+    pub async fn get_connections_by_protocol(
+        &self,
+        protocol: &str,
+        limit: u32,
+    ) -> Result<Vec<TcpConnectionRow>> {
+        let connections = self
+            .client
+            .query(
+                "SELECT * FROM tcp_connections WHERE protocol = ? ORDER BY timestamp DESC LIMIT ?",
+            )
+            .bind(protocol)
+            .bind(limit)
+            .fetch_all::<TcpConnectionRow>()
+            .await?;
+        Ok(connections)
+    }
+
+    /// Query TCP connections by target host
+    pub async fn get_connections_by_host(
+        &self,
+        host: &str,
+        limit: u32,
+    ) -> Result<Vec<TcpConnectionRow>> {
+        let connections = self
+            .client
+            .query("SELECT * FROM tcp_connections WHERE target_host LIKE ? ORDER BY timestamp DESC LIMIT ?")
+            .bind(format!("%{}%", host))
+            .bind(limit)
+            .fetch_all::<TcpConnectionRow>()
+            .await?;
+        Ok(connections)
+    }
 }
 
 /// OpenTelemetry span record stored in ClickHouse
@@ -307,6 +582,202 @@ pub struct HostSummary {
     pub request_count: u64,
     pub avg_duration_ms: f64,
     pub last_seen: i64,
+}
+
+/// Database query record stored in ClickHouse
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Row)]
+pub struct DatabaseQueryRow {
+    pub id: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: String,
+    pub timestamp: i64,
+    pub duration_ms: f64,
+    pub db_system: String,
+    pub db_name: String,
+    pub db_user: String,
+    pub db_operation: String,
+    pub db_statement: String,
+    pub db_rows_affected: i64,
+    pub server_address: String,
+    pub server_port: u16,
+    pub client_address: String,
+    pub success: u8,
+    pub error_message: String,
+    pub error_code: String,
+    pub application_name: String,
+    pub attributes: String,
+}
+
+/// Kafka message record stored in ClickHouse
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Row)]
+pub struct KafkaMessageRow {
+    pub id: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: String,
+    pub timestamp: i64,
+    pub duration_ms: f64,
+    pub messaging_system: String,
+    pub messaging_operation: String,
+    pub operation_type: String,
+    pub messaging_destination: String,
+    pub messaging_consumer_group: String,
+    pub messaging_client_id: String,
+    pub kafka_api_key: i16,
+    pub kafka_api_version: i16,
+    pub kafka_correlation_id: i32,
+    pub message_count: i32,
+    pub payload_size: i64,
+    pub server_address: String,
+    pub server_port: u16,
+    pub client_address: String,
+    pub success: u8,
+    pub error_code: i16,
+    pub error_message: String,
+    pub attributes: String,
+}
+
+/// TCP connection record for raw packet tracking
+/// This captures ALL connections through the SOCKS proxy, even if protocol is unknown
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Row)]
+pub struct TcpConnectionRow {
+    /// Unique connection ID
+    pub id: String,
+    /// Trace ID for distributed tracing
+    pub trace_id: String,
+    /// Span ID
+    pub span_id: String,
+    /// Connection start timestamp (milliseconds since epoch)
+    pub timestamp: i64,
+    /// Connection duration in milliseconds
+    pub duration_ms: f64,
+    /// Detected protocol (postgresql, kafka, unknown, etc.)
+    pub protocol: String,
+    /// How protocol was detected (wire, port, none)
+    pub protocol_detected: String,
+    /// Whether protocol was detected from wire data (vs port fallback)
+    pub wire_detected: u8,
+    /// Client IP address
+    pub client_address: String,
+    /// Client port
+    pub client_port: u16,
+    /// Server IP address (resolved)
+    pub server_address: String,
+    /// Server port
+    pub server_port: u16,
+    /// Original target hostname (e.g., kafka.messaging.svc.cluster.local)
+    pub target_host: String,
+    /// Total bytes sent (client to server)
+    pub bytes_sent: u64,
+    /// Total bytes received (server to client)
+    pub bytes_received: u64,
+    /// Number of client messages parsed
+    pub client_messages: u64,
+    /// Number of server messages parsed
+    pub server_messages: u64,
+    /// Number of parse errors
+    pub parse_errors: u64,
+    /// First N bytes of connection (hex encoded) for debugging
+    pub initial_bytes_hex: String,
+    /// First N bytes as ASCII (printable chars only)
+    pub initial_bytes_ascii: String,
+    /// Sample of request data (hex)
+    pub sample_request_hex: String,
+    /// Sample of response data (hex)
+    pub sample_response_hex: String,
+    /// Connection status (ok, error, timeout)
+    pub status: String,
+    /// Error message if connection failed
+    pub error_message: String,
+    /// Additional attributes as JSON
+    pub attributes: String,
+}
+
+/// Connection status for TCP connections
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    /// Connection completed successfully
+    Ok,
+    /// Connection had an error
+    Error,
+    /// Connection timed out
+    Timeout,
+    /// Connection was reset
+    Reset,
+}
+
+impl fmt::Display for ConnectionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectionStatus::Ok => write!(f, "ok"),
+            ConnectionStatus::Error => write!(f, "error"),
+            ConnectionStatus::Timeout => write!(f, "timeout"),
+            ConnectionStatus::Reset => write!(f, "reset"),
+        }
+    }
+}
+
+impl TcpConnectionRow {
+    /// Create a new TCP connection record
+    pub fn new(
+        target_host: String,
+        server_address: String,
+        server_port: u16,
+        client_address: String,
+        client_port: u16,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            trace_id: format!("{:032x}", rand::random::<u128>()),
+            span_id: format!("{:016x}", rand::random::<u64>()),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            duration_ms: 0.0,
+            protocol: "unknown".to_string(),
+            protocol_detected: "none".to_string(),
+            wire_detected: 0,
+            client_address,
+            client_port,
+            server_address,
+            server_port,
+            target_host,
+            bytes_sent: 0,
+            bytes_received: 0,
+            client_messages: 0,
+            server_messages: 0,
+            parse_errors: 0,
+            initial_bytes_hex: String::new(),
+            initial_bytes_ascii: String::new(),
+            sample_request_hex: String::new(),
+            sample_response_hex: String::new(),
+            status: "ok".to_string(),
+            error_message: String::new(),
+            attributes: "{}".to_string(),
+        }
+    }
+
+    /// Convert bytes to hex string (limited to first N bytes)
+    pub fn bytes_to_hex(data: &[u8], max_bytes: usize) -> String {
+        data.iter()
+            .take(max_bytes)
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Convert bytes to ASCII string (printable chars only)
+    pub fn bytes_to_ascii(data: &[u8], max_bytes: usize) -> String {
+        data.iter()
+            .take(max_bytes)
+            .map(|&b| {
+                if b.is_ascii_graphic() || b == b' ' {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect()
+    }
 }
 
 // SQL schema definitions
@@ -380,6 +851,112 @@ AS SELECT
     max(timestamp) as last_seen
 FROM http_requests
 GROUP BY host
+";
+
+const DATABASE_QUERIES_TABLE_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS database_queries (
+    id String,
+    trace_id String,
+    span_id String,
+    parent_span_id String,
+    timestamp Int64,
+    duration_ms Float64,
+    db_system String,
+    db_name String,
+    db_user String,
+    db_operation String,
+    db_statement String,
+    db_rows_affected Int64,
+    server_address String,
+    server_port UInt16,
+    client_address String,
+    success UInt8,
+    error_message String,
+    error_code String,
+    application_name String,
+    attributes String,
+    INDEX idx_trace_id trace_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_db_system db_system TYPE set(10) GRANULARITY 1,
+    INDEX idx_db_operation db_operation TYPE set(20) GRANULARITY 1,
+    INDEX idx_success success TYPE set(2) GRANULARITY 1
+) ENGINE = MergeTree()
+ORDER BY (db_system, timestamp, id)
+PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(timestamp))
+TTL fromUnixTimestamp64Milli(timestamp) + INTERVAL 7 DAY
+";
+
+const KAFKA_MESSAGES_TABLE_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS kafka_messages (
+    id String,
+    trace_id String,
+    span_id String,
+    parent_span_id String,
+    timestamp Int64,
+    duration_ms Float64,
+    messaging_system String,
+    messaging_operation String,
+    operation_type String,
+    messaging_destination String,
+    messaging_consumer_group String,
+    messaging_client_id String,
+    kafka_api_key Int16,
+    kafka_api_version Int16,
+    kafka_correlation_id Int32,
+    message_count Int32,
+    payload_size Int64,
+    server_address String,
+    server_port UInt16,
+    client_address String,
+    success UInt8,
+    error_code Int16,
+    error_message String,
+    attributes String,
+    INDEX idx_trace_id trace_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_operation messaging_operation TYPE set(50) GRANULARITY 1,
+    INDEX idx_destination messaging_destination TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_consumer_group messaging_consumer_group TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_success success TYPE set(2) GRANULARITY 1
+) ENGINE = MergeTree()
+ORDER BY (messaging_operation, timestamp, id)
+PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(timestamp))
+TTL fromUnixTimestamp64Milli(timestamp) + INTERVAL 7 DAY
+";
+
+const TCP_CONNECTIONS_TABLE_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS tcp_connections (
+    id String,
+    trace_id String,
+    span_id String,
+    timestamp Int64,
+    duration_ms Float64,
+    protocol String,
+    protocol_detected String,
+    wire_detected UInt8,
+    client_address String,
+    client_port UInt16,
+    server_address String,
+    server_port UInt16,
+    target_host String,
+    bytes_sent UInt64,
+    bytes_received UInt64,
+    client_messages UInt64,
+    server_messages UInt64,
+    parse_errors UInt64,
+    initial_bytes_hex String,
+    initial_bytes_ascii String,
+    sample_request_hex String,
+    sample_response_hex String,
+    status String,
+    error_message String,
+    attributes String,
+    INDEX idx_trace_id trace_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_protocol protocol TYPE set(20) GRANULARITY 1,
+    INDEX idx_target_host target_host TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_status status TYPE set(10) GRANULARITY 1
+) ENGINE = MergeTree()
+ORDER BY (protocol, timestamp, id)
+PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(timestamp))
+TTL fromUnixTimestamp64Milli(timestamp) + INTERVAL 7 DAY
 ";
 
 #[cfg(test)]

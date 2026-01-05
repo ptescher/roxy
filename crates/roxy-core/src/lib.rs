@@ -17,12 +17,13 @@ pub mod updater;
 
 // Re-export specific items to avoid ambiguous glob exports
 pub use models::{
-    AppSummary, HttpHeader, HttpMethod, HttpRequest, HttpResponse, HttpTransaction,
-    TransactionStatus,
+    AppSummary, DatabaseQueryRecord, HttpHeader, HttpMethod, HttpRequest, HttpResponse,
+    HttpTransaction, KafkaMessageRecord, KafkaOperation, ProtocolType, TransactionStatus,
 };
 
 pub use clickhouse::{
-    ClickHouseConfig, HostSummary, HttpRequestRecord, RoxyClickHouse, SpanRecord,
+    ClickHouseConfig, ConnectionStatus, DatabaseQueryRow, HostSummary, HttpRequestRecord,
+    KafkaMessageRow, RoxyClickHouse, SpanRecord, TcpConnectionRow,
 };
 
 pub use services::{ManagedService, ServiceManager};

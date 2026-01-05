@@ -21,18 +21,19 @@ use cocoa::{
 #[cfg(target_os = "macos")]
 use objc::{class, msg_send, sel, sel_impl};
 
-use roxy_proxy::{ProxyConfig, ProxyServer};
+use roxy_proxy::{system_proxy, ProxyConfig, ProxyServer};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use components::{
-    open_about_window, DetailPanel, DetailPanelProps, DetailTab, RequestList, RequestListProps,
-    Sidebar, SidebarProps, StatusBar, StatusBarProps, TitleBar, TitleBarProps, Toolbar,
-    ToolbarProps,
+    connection_detail_panel, connection_list, flow_diagram, open_about_window,
+    ConnectionDetailPanelProps, ConnectionDetailTab, ConnectionListProps, DetailPanel,
+    DetailPanelProps, DetailTab, KubernetesPanelProps, RequestList, RequestListProps, Sidebar,
+    SidebarProps, StatusBar, StatusBarProps, TitleBar, TitleBarProps,
 };
-use state::{AppState, ProxyStatus, UiMessage};
-use theme::{colors, dimensions};
+use state::{AppState, ProxyStatus, UiMessage, ViewMode};
+use theme::{colors, dimensions, font_size, spacing};
 
 // Define actions for the menu bar
 actions!(
@@ -194,6 +195,38 @@ impl RoxyApp {
                         }
                     }
 
+                    // Poll for TCP connections (PostgreSQL, Kafka, etc.)
+                    tracing::debug!("[POLLER] Poll #{}: Querying TCP connections...", poll_count);
+                    match clickhouse.get_recent_connections(100).await {
+                        Ok(connections) => {
+                            tracing::info!(
+                                "[POLLER] Poll #{}: SUCCESS - Got {} TCP connections from ClickHouse",
+                                poll_count,
+                                connections.len()
+                            );
+                            for (i, conn) in connections.iter().take(3).enumerate() {
+                                tracing::debug!(
+                                    "[POLLER]   Connection {}: {} {} -> {} ({})",
+                                    i,
+                                    conn.protocol,
+                                    conn.target_host,
+                                    conn.server_address,
+                                    conn.status
+                                );
+                            }
+                            if let Err(e) = poll_tx.send(UiMessage::ConnectionsUpdated(connections)) {
+                                tracing::error!("[POLLER] Failed to send connections to UI: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[POLLER] Poll #{}: FAILED to fetch TCP connections: {:?}",
+                                poll_count,
+                                e
+                            );
+                        }
+                    }
+
                     // Poll every second
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -320,38 +353,162 @@ impl RoxyApp {
             .flex_col()
             .flex_1()
             .overflow_hidden()
-            // Toolbar - fixed height, no shrink
-            .child(div().flex_shrink_0().child(self.render_toolbar()))
-            // Request list - fills remaining space
+            // Toolbar with view switcher - fixed height, no shrink
+            .child(div().flex_shrink_0().child(self.render_toolbar(cx)))
+            // Main content area - depends on view mode
+            .when(self.state.view_mode == ViewMode::Requests, |this| {
+                this
+                    // Request list - fills remaining space
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(100.0))
+                            .overflow_hidden()
+                            .child(self.render_request_list(cx)),
+                    )
+                    // Resize handle - fixed height, no shrink
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .child(self.render_detail_panel_resize_handle(cx)),
+                    )
+                    // Detail panel - fixed height from state, no shrink
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(detail_height))
+                            .child(self.render_detail_panel(cx)),
+                    )
+            })
+            .when(self.state.view_mode == ViewMode::Connections, |this| {
+                this
+                    // Connection list - fills remaining space
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(100.0))
+                            .overflow_hidden()
+                            .child(self.render_connection_list(cx)),
+                    )
+                    // Resize handle - fixed height, no shrink
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .child(self.render_detail_panel_resize_handle(cx)),
+                    )
+                    // Connection detail panel - fixed height from state, no shrink
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .h(px(detail_height))
+                            .child(self.render_connection_detail_panel(cx)),
+                    )
+            })
+            .when(self.state.view_mode == ViewMode::Kubernetes, |this| {
+                this.child(self.render_kubernetes_panel(cx))
+            })
+    }
+
+    /// Render the toolbar component with view switcher
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let view_mode = self.state.view_mode;
+
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(dimensions::TOOLBAR_HEIGHT)
+            .px(spacing::MD)
+            .border_b_1()
+            .border_color(rgb(colors::SURFACE_0))
+            .bg(rgb(colors::BASE))
+            // Left side - view mode tabs
             .child(
                 div()
-                    .flex_1()
-                    .min_h(px(100.0))
-                    .overflow_hidden()
-                    .child(self.render_request_list(cx)),
+                    .flex()
+                    .items_center()
+                    .gap(spacing::XXS)
+                    .child(self.render_view_tab(ViewMode::Requests, view_mode, cx))
+                    .child(self.render_view_tab(ViewMode::Connections, view_mode, cx))
+                    .child(self.render_view_tab(ViewMode::Kubernetes, view_mode, cx)),
             )
-            // Resize handle - fixed height, no shrink
+            // Right side - request count or k8s status
             .child(
                 div()
-                    .flex_shrink_0()
-                    .child(self.render_detail_panel_resize_handle(cx)),
-            )
-            // Detail panel - fixed height from state, no shrink
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .h(px(detail_height))
-                    .child(self.render_detail_panel(cx)),
+                    .text_size(font_size::SM)
+                    .text_color(rgb(colors::SUBTEXT_0))
+                    .child(match view_mode {
+                        ViewMode::Requests => format!("{} requests", self.state.request_count()),
+                        ViewMode::Connections => {
+                            format!("{} connections", self.state.tcp_connections.len())
+                        }
+                        ViewMode::Kubernetes => {
+                            format!("{} port forwards", self.state.k8s_port_forwards.len())
+                        }
+                    }),
             )
     }
 
-    /// Render the toolbar component
-    fn render_toolbar(&self) -> impl IntoElement {
-        Toolbar::new(ToolbarProps {
-            request_count: self.state.request_count(),
-            active_filter: Default::default(),
-        })
-        .render()
+    /// Render a view mode tab button
+    fn render_view_tab(
+        &self,
+        mode: ViewMode,
+        current: ViewMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let is_active = mode == current;
+
+        let bg = if is_active {
+            rgb(colors::SURFACE_0)
+        } else {
+            rgba(colors::TRANSPARENT)
+        };
+        let text_color = if is_active {
+            rgb(colors::TEXT)
+        } else {
+            rgb(colors::SUBTEXT_0)
+        };
+
+        div()
+            .px(spacing::SM)
+            .py(spacing::XS)
+            .rounded(dimensions::BORDER_RADIUS)
+            .bg(bg)
+            .text_size(font_size::SM)
+            .font_weight(if is_active {
+                FontWeight::MEDIUM
+            } else {
+                FontWeight::NORMAL
+            })
+            .text_color(text_color)
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(colors::SURFACE_0)))
+            .child(mode.label().to_string())
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                entity.update(cx, |app, cx| {
+                    app.state.set_view_mode(mode);
+                    cx.notify();
+                });
+            })
+    }
+
+    /// Render the Kubernetes overview panel
+    fn render_kubernetes_panel(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let props = KubernetesPanelProps {
+            port_forwards: self.state.k8s_port_forwards.clone(),
+            http_routes: self.state.k8s_http_routes.clone(),
+            width: 800.0, // Will be overridden by flex
+            height: 600.0,
+            scroll_handle: self.state.kubernetes_scroll_handle.clone(),
+        };
+
+        div()
+            .flex_1()
+            .overflow_hidden()
+            .p(spacing::MD)
+            .child(flow_diagram(&props))
     }
 
     /// Render the request list component
@@ -389,6 +546,53 @@ impl RoxyApp {
         .render()
     }
 
+    /// Render the connection detail panel
+    fn render_connection_detail_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let on_tab_select: Arc<dyn Fn(ConnectionDetailTab, &mut App) + Send + Sync + 'static> =
+            Arc::new(move |tab: ConnectionDetailTab, cx: &mut App| {
+                entity.update(cx, |app, cx| {
+                    app.state.active_connection_detail_tab = tab;
+                    cx.notify();
+                });
+            });
+
+        connection_detail_panel(ConnectionDetailPanelProps {
+            selected_connection: self.state.selected_connection.clone(),
+            active_tab: self.state.active_connection_detail_tab,
+            on_tab_select: Some(on_tab_select),
+            height: self.state.detail_panel_height,
+            scroll_handle: self.state.connection_detail_scroll_handle.clone(),
+        })
+    }
+
+    /// Render the connection list component
+    fn render_connection_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let on_connection_select: Arc<
+            dyn Fn(&roxy_core::TcpConnectionRow, &mut App) + Send + Sync + 'static,
+        > = Arc::new(
+            move |connection: &roxy_core::TcpConnectionRow, cx: &mut App| {
+                let connection = connection.clone();
+                entity.update(cx, |app, cx| {
+                    app.state.selected_connection = Some(connection);
+                    cx.notify();
+                });
+            },
+        );
+
+        connection_list(ConnectionListProps {
+            connections: self.state.tcp_connections.clone(),
+            selected_connection_id: self
+                .state
+                .selected_connection
+                .as_ref()
+                .map(|c| c.id.clone()),
+            on_connection_select: Some(on_connection_select),
+            scroll_handle: self.state.connections_scroll_handle.clone(),
+        })
+    }
+
     /// Render the detail panel component
     fn render_detail_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity().clone();
@@ -411,12 +615,43 @@ impl RoxyApp {
     }
 
     /// Render the status bar component
-    fn render_status_bar(&self) -> impl IntoElement {
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+        let on_system_proxy_toggle: std::sync::Arc<dyn Fn(bool, &mut App) + Send + Sync + 'static> =
+            std::sync::Arc::new(move |enabled: bool, cx: &mut App| {
+                entity.update(cx, |app, cx| {
+                    if enabled {
+                        if let Err(e) = system_proxy::set_system_proxy(8080) {
+                            tracing::error!("Failed to enable system proxy: {}", e);
+                            app.state.error_message =
+                                Some(format!("Failed to enable system proxy: {}", e));
+                        } else {
+                            tracing::info!(
+                                "System proxy enabled - all macOS traffic now routes through Roxy"
+                            );
+                            app.state.set_system_proxy_enabled(true);
+                        }
+                    } else {
+                        if let Err(e) = system_proxy::clear_system_proxy() {
+                            tracing::error!("Failed to disable system proxy: {}", e);
+                            app.state.error_message =
+                                Some(format!("Failed to disable system proxy: {}", e));
+                        } else {
+                            tracing::info!("System proxy disabled");
+                            app.state.set_system_proxy_enabled(false);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+
         StatusBar::new(StatusBarProps {
             request_count: self.state.request_count(),
             error_message: self.state.error_message.clone(),
             clickhouse_connected: true, // TODO: actual connection check
             otel_connected: true,       // TODO: actual connection check
+            system_proxy_enabled: self.state.system_proxy_enabled,
+            on_system_proxy_toggle: Some(on_system_proxy_toggle),
         })
         .render()
     }
@@ -451,7 +686,7 @@ impl Render for RoxyApp {
                     .child(self.render_sidebar_resize_handle(cx))
                     .child(self.render_main_content(cx)),
             )
-            .child(self.render_status_bar());
+            .child(self.render_status_bar(cx));
 
         // Always add global mouse handlers for resizing
         container = container
@@ -633,6 +868,12 @@ fn main() {
 
         // Register global action handlers
         cx.on_action(|_: &Quit, cx| {
+            // Clear system proxy before quitting to restore network settings
+            if let Err(e) = system_proxy::clear_system_proxy() {
+                tracing::error!("Failed to clear system proxy on quit: {}", e);
+            } else {
+                tracing::info!("System proxy cleared on quit");
+            }
             cx.quit();
         });
 

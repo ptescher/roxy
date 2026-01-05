@@ -164,6 +164,7 @@ struct GitHubAsset {
 
 /// GitHub release response
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct GitHubRelease {
     tag_name: String,
     name: String,
