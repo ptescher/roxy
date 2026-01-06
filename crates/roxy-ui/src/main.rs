@@ -416,28 +416,42 @@ impl RoxyApp {
             })
         };
 
-        // Host selection callback - switches to Requests view
+        // Host selection callback - filters based on current view mode
         let on_host_select: Arc<dyn Fn(&str, &mut App) + Send + Sync + 'static> = {
             let entity = entity.clone();
             Arc::new(move |host: &str, cx: &mut App| {
                 let host = host.to_string();
                 entity.update(cx, |app, cx| {
-                    app.state.select_host(host);
-                    // Switch to Requests view when a host is selected
-                    app.state.set_view_mode(ViewMode::Requests);
+                    match app.state.view_mode {
+                        ViewMode::Messaging => {
+                            // In messaging mode, filter by broker
+                            app.state.select_broker(host);
+                        }
+                        _ => {
+                            // In other modes, filter by host and switch to Requests
+                            app.state.select_host(host.clone());
+                            app.state.set_view_mode(ViewMode::Requests);
+                        }
+                    }
                     cx.notify();
                 });
             })
         };
 
-        // Clear host filter callback - switches to Requests view
+        // Clear host filter callback - clears filter based on current view mode
         let on_clear_host_filter: Arc<dyn Fn(&mut App) + Send + Sync + 'static> = {
             let entity = entity.clone();
             Arc::new(move |cx: &mut App| {
                 entity.update(cx, |app, cx| {
-                    app.state.clear_host_filter();
-                    // Switch to Requests view
-                    app.state.set_view_mode(ViewMode::Requests);
+                    match app.state.view_mode {
+                        ViewMode::Messaging => {
+                            app.state.clear_broker_filter();
+                        }
+                        _ => {
+                            app.state.clear_host_filter();
+                            app.state.set_view_mode(ViewMode::Requests);
+                        }
+                    }
                     cx.notify();
                 });
             })
@@ -507,11 +521,27 @@ impl RoxyApp {
             })
         };
 
+        // Combine HTTP hosts with Kafka brokers for the hosts list
+        let mut all_hosts = self.state.hosts.clone();
+        let kafka_brokers = self.state.kafka_brokers();
+        for broker in kafka_brokers {
+            // Only add if not already present
+            if !all_hosts.iter().any(|h| h.host == broker.host) {
+                all_hosts.push(broker);
+            }
+        }
+
+        // Selected host depends on view mode
+        let selected_host = match self.state.view_mode {
+            ViewMode::Messaging => self.state.selected_broker.clone(),
+            _ => self.state.selected_host.clone(),
+        };
+
         LeftDock::new(LeftDockProps {
             active_tab: self.state.left_dock_tab,
             proxy_status: self.state.proxy_status.clone(),
-            hosts: self.state.hosts.clone(),
-            selected_host: self.state.selected_host.clone(),
+            hosts: all_hosts,
+            selected_host,
             services: self.state.services.clone(),
             selected_service: self.state.selected_service.clone(),
             kube_contexts: self.state.kube_contexts.clone(),
@@ -941,8 +971,19 @@ impl RoxyApp {
             });
         });
 
+        // Use filtered messages when a broker is selected
+        let messages: Vec<roxy_core::KafkaMessageRow> = if self.state.selected_broker.is_some() {
+            self.state
+                .filtered_kafka_messages()
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            self.state.kafka_messages.clone()
+        };
+
         messaging_list(MessagingListProps {
-            messages: self.state.kafka_messages.clone(),
+            messages,
             selected_message_id: self
                 .state
                 .selected_kafka_message

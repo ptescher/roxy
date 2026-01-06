@@ -7,3 +7,5 @@ This repo exists as an open source tool for developers. We expect it to be easy 
 When adding new features, think about the correct domain abstractions and implement libraries as necessary.
 
 Write documentation targeting software engineers. Keep it short and to the point. We don't need to list out features, examples, or architecture unless strictly necessary.
+
+When adding major features, make sure to update the roadmap in [README.md](README.md)

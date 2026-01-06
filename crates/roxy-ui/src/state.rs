@@ -246,6 +246,9 @@ pub struct AppState {
     /// Currently selected host filter
     pub selected_host: Option<String>,
 
+    /// Currently selected broker filter for messaging view
+    pub selected_broker: Option<String>,
+
     /// Currently selected request for detail view
     pub selected_request: Option<HttpRequestRecord>,
 
@@ -405,6 +408,7 @@ impl AppState {
             hosts: Vec::new(),
             requests: Vec::new(),
             selected_host: None,
+            selected_broker: None,
             selected_request: None,
             active_detail_tab: DetailTab::default(),
             error_message: None,
@@ -601,6 +605,7 @@ impl AppState {
         self.hosts.clear();
         self.selected_request = None;
         self.selected_host = None;
+        self.selected_broker = None;
     }
 
     /// Select a request for detail view
@@ -621,6 +626,62 @@ impl AppState {
     /// Clear the host filter
     pub fn clear_host_filter(&mut self) {
         self.selected_host = None;
+    }
+
+    /// Select a broker filter for messaging view
+    pub fn select_broker(&mut self, broker: String) {
+        self.selected_broker = Some(broker);
+    }
+
+    /// Clear the broker filter
+    pub fn clear_broker_filter(&mut self) {
+        self.selected_broker = None;
+    }
+
+    /// Get filtered kafka messages based on selected broker
+    pub fn filtered_kafka_messages(&self) -> Vec<&KafkaMessageRow> {
+        self.kafka_messages
+            .iter()
+            .filter(|m| {
+                match &self.selected_broker {
+                    Some(broker) => {
+                        // Match against server_address:server_port
+                        let msg_broker = format!("{}:{}", m.server_address, m.server_port);
+                        &msg_broker == broker || &m.server_address == broker
+                    }
+                    None => true,
+                }
+            })
+            .collect()
+    }
+
+    /// Get unique kafka brokers from messages
+    pub fn kafka_brokers(&self) -> Vec<HostSummary> {
+        use std::collections::HashMap;
+
+        let mut broker_stats: HashMap<String, (u64, f64, i64)> = HashMap::new();
+
+        for msg in &self.kafka_messages {
+            let broker = format!("{}:{}", msg.server_address, msg.server_port);
+            let entry = broker_stats.entry(broker).or_insert((0, 0.0, 0));
+            entry.0 += 1; // request count
+            entry.1 += msg.duration_ms; // total duration for avg
+            entry.2 = entry.2.max(msg.timestamp); // last seen
+        }
+
+        broker_stats
+            .into_iter()
+            .map(|(host, (count, total_duration, last_seen))| HostSummary {
+                host,
+                request_count: count,
+                avg_duration_ms: if count > 0 {
+                    total_duration / count as f64
+                } else {
+                    0.0
+                },
+                last_seen,
+            })
+            .collect()
     }
 
     /// Get filtered requests based on selected host and/or service

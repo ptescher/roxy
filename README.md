@@ -668,13 +668,13 @@ For code signing and notarization (required for distribution), set these environ
 - [x] Graceful subprocess management
 - [x] Routing rule data model
 - [x] Kubernetes port-forward data model
-- [ ] Routing rule evaluation engine
+- [x] Gateway API / HTTPRoute-based routing
 - [x] OpenTelemetry span creation for traced requests
 - [x] Store captured requests in ClickHouse via otel collector
-- [ ] SOCKS5 proxy support
+- [x] SOCKS5 proxy support for TCP connections
 - [x] Kubernetes service discovery
-- [ ] PostgreSQL instrumentation
-- [ ] Kafka instrumentation
+- [x] PostgreSQL protocol parsing and query capture
+- [x] Kafka protocol parsing and message capture
 - [ ] OpenAPI schema awareness
 - [ ] Request/response modification
 - [ ] Breakpoints and debugging
@@ -690,11 +690,14 @@ For code signing and notarization (required for distribution), set these environ
 - [x] Request row click to select and view details
 - [x] Host sidebar click to filter requests
 - [x] Set up proper Mac app with icon, "About Roxy", etc
-- [ ] Break out front end into proper reactive architecute with separate views, components, etc
+- [x] Kubernetes panel with flow diagram visualization
+- [x] Real-time updates from ClickHouse (polling)
+- [x] Database queries panel (PostgreSQL)
+- [x] Messaging panel (Kafka)
+- [x] TCP connections panel
+- [ ] Break out front end into proper reactive architecture with separate views, components, etc
 - [ ] Basic filtering (real time search)
 - [ ] Routing rules panel (create/edit/delete)
-- [ ] Kubernetes panel (clusters, port-forwards)
-- [ ] Real-time updates from ClickHouse
 - [ ] Request filtering and search
 - [ ] Trace waterfall visualization
 - [ ] Request/response body formatting (JSON, XML, etc.)
@@ -706,6 +709,7 @@ For code signing and notarization (required for distribution), set these environ
 - [x] Auto-download service binaries
 - [x] Platform detection (macOS, Linux)
 - [x] Update checking from GitHub releases
+- [ ] Kubernetes watch API for real-time resource updates (replace polling)
 - [ ] Automatic update installation
 - [ ] Crash reporting (opt-in)
 - [ ] Telemetry (opt-in)
