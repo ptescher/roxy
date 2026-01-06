@@ -52,6 +52,9 @@ uuid.workspace = true
 url.workspace = true
 rand.workspace = true
 
+# Process identification (for finding which app is connecting)
+libproc = "0.14"
+
 # Kubernetes
 kube.workspace = true
 k8s-openapi.workspace = true

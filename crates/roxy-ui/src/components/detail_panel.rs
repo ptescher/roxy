@@ -220,7 +220,7 @@ impl DetailPanel {
 
     /// Render general request information
     fn render_general_info(&self, request: &HttpRequestRecord) -> impl IntoElement {
-        div()
+        let mut el = div()
             .flex()
             .flex_col()
             .gap(spacing::XXS)
@@ -228,7 +228,14 @@ impl DetailPanel {
             .child(self.render_info_row("Request Method", &request.method))
             .child(self.render_info_row("Status Code", &request.response_status.to_string()))
             .child(self.render_info_row("Remote Address", &request.server_ip))
-            .child(self.render_info_row("Protocol", &request.protocol))
+            .child(self.render_info_row("Protocol", &request.protocol));
+
+        // Add client name if present
+        if !request.client_name.is_empty() {
+            el = el.child(self.render_info_row("Client App", &request.client_name));
+        }
+
+        el
     }
 
     /// Render an info row with label and value

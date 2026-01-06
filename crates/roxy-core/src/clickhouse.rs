@@ -94,6 +94,15 @@ impl RoxyClickHouse {
             .await
             .context("Failed to create http_requests table")?;
 
+        // Migration: Add client_name column if it doesn't exist (for existing tables)
+        self.client
+            .query(
+                "ALTER TABLE http_requests ADD COLUMN IF NOT EXISTS client_name String DEFAULT ''",
+            )
+            .execute()
+            .await
+            .context("Failed to add client_name column")?;
+
         // Create hosts summary materialized view
         self.client
             .query(HOSTS_SUMMARY_VIEW_SCHEMA)
@@ -152,13 +161,13 @@ impl RoxyClickHouse {
                 id, trace_id, span_id, timestamp, method, url, host, path, query,
                 request_headers, request_body, request_body_size,
                 response_status, response_headers, response_body, response_body_size,
-                duration_ms, error, client_ip, server_ip, protocol, tls_version
+                duration_ms, error, client_ip, server_ip, protocol, tls_version, client_name
             ) VALUES (
                 '{id}', '{trace_id}', '{span_id}', {timestamp}, '{method}', '{url}',
                 '{host}', '{path}', '{query}', '{request_headers}', '{request_body}',
                 {request_body_size}, {response_status}, '{response_headers}',
                 '{response_body}', {response_body_size}, {duration_ms}, '{error}',
-                '{client_ip}', '{server_ip}', '{protocol}', '{tls_version}'
+                '{client_ip}', '{server_ip}', '{protocol}', '{tls_version}', '{client_name}'
             )",
             id = request.id,
             trace_id = escape_string(&request.trace_id),
@@ -182,6 +191,7 @@ impl RoxyClickHouse {
             server_ip = escape_string(&request.server_ip),
             protocol = escape_string(&request.protocol),
             tls_version = escape_string(&request.tls_version),
+            client_name = escape_string(&request.client_name),
         );
 
         self.client
@@ -239,6 +249,50 @@ impl RoxyClickHouse {
             .fetch_all::<HostSummary>()
             .await?;
         Ok(hosts)
+    }
+
+    /// Get all unique client services/applications
+    ///
+    /// Returns an empty vec if the client_name column doesn't exist yet
+    /// (graceful handling for schema migrations).
+    pub async fn get_client_services(&self) -> Result<Vec<ClientServiceSummary>> {
+        // First check if the client_name column exists
+        let column_exists = self
+            .client
+            .query(
+                r"
+                SELECT count() as cnt
+                FROM system.columns
+                WHERE database = 'roxy' AND table = 'http_requests' AND name = 'client_name'
+                ",
+            )
+            .fetch_one::<u64>()
+            .await
+            .unwrap_or(0);
+
+        if column_exists == 0 {
+            // Column doesn't exist yet, return empty
+            return Ok(Vec::new());
+        }
+
+        let services = self
+            .client
+            .query(
+                r"
+                SELECT
+                    client_name,
+                    count() as request_count,
+                    avg(duration_ms) as avg_duration_ms,
+                    max(timestamp) as last_seen
+                FROM http_requests
+                WHERE client_name != ''
+                GROUP BY client_name
+                ORDER BY request_count DESC
+                ",
+            )
+            .fetch_all::<ClientServiceSummary>()
+            .await?;
+        Ok(services)
     }
 
     /// Get spans for a trace
@@ -526,6 +580,73 @@ impl RoxyClickHouse {
             .await?;
         Ok(connections)
     }
+
+    /// Get active Kubernetes service connections (connections in the last N seconds)
+    ///
+    /// This returns unique K8s service connections that are recent enough to be
+    /// considered "active", useful for showing port forwards in the UI.
+    pub async fn get_active_k8s_connections(
+        &self,
+        max_age_seconds: u64,
+    ) -> Result<Vec<ActiveK8sConnection>> {
+        let connections = self
+            .client
+            .query(
+                r"
+                SELECT
+                    target_host,
+                    server_port,
+                    count() as connection_count,
+                    max(timestamp) as last_seen
+                FROM tcp_connections
+                WHERE target_host LIKE '%.svc.cluster.local'
+                  AND timestamp > (now64(3) - ?) * 1000
+                GROUP BY target_host, server_port
+                ORDER BY last_seen DESC
+                ",
+            )
+            .bind(max_age_seconds as i64)
+            .fetch_all::<ActiveK8sConnection>()
+            .await?;
+        Ok(connections)
+    }
+}
+
+/// Active Kubernetes service connection summary
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Row)]
+pub struct ActiveK8sConnection {
+    /// Target host (e.g., postgres.database.svc.cluster.local)
+    pub target_host: String,
+    /// Server port
+    pub server_port: u16,
+    /// Number of connections
+    pub connection_count: u64,
+    /// Last time this connection was seen (timestamp)
+    pub last_seen: i64,
+}
+
+impl ActiveK8sConnection {
+    /// Parse the namespace from the target host
+    pub fn namespace(&self) -> Option<String> {
+        // Format: service.namespace.svc.cluster.local
+        let parts: Vec<&str> = self.target_host.split('.').collect();
+        if parts.len() >= 2 {
+            Some(parts[1].to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Parse the service name from the target host
+    pub fn service_name(&self) -> Option<String> {
+        // Format: service.namespace.svc.cluster.local
+        let parts: Vec<&str> = self.target_host.split('.').collect();
+        if !parts.is_empty() {
+            Some(parts[0].to_string())
+        } else {
+            None
+        }
+    }
 }
 
 /// OpenTelemetry span record stored in ClickHouse
@@ -573,6 +694,8 @@ pub struct HttpRequestRecord {
     pub server_ip: String,
     pub protocol: String,
     pub tls_version: String,
+    /// Name of the client application making requests (extracted from headers)
+    pub client_name: String,
 }
 
 /// Summary of requests per host
@@ -581,6 +704,19 @@ pub struct HostSummary {
     pub host: String,
     pub request_count: u64,
     pub avg_duration_ms: f64,
+    pub last_seen: i64,
+}
+
+/// Summary of requests per client service/application
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Row)]
+pub struct ClientServiceSummary {
+    /// Client name (from X-Client-Name header or User-Agent)
+    pub client_name: String,
+    /// Number of HTTP requests from this client
+    pub request_count: u64,
+    /// Average response time in ms
+    pub avg_duration_ms: f64,
+    /// Last time this client was seen (timestamp)
     pub last_seen: i64,
 }
 
@@ -830,10 +966,12 @@ CREATE TABLE IF NOT EXISTS http_requests (
     server_ip String,
     protocol String,
     tls_version String,
+    client_name String DEFAULT '',
     INDEX idx_host host TYPE bloom_filter GRANULARITY 1,
     INDEX idx_trace_id trace_id TYPE bloom_filter GRANULARITY 1,
     INDEX idx_method method TYPE set(10) GRANULARITY 1,
-    INDEX idx_status response_status TYPE set(100) GRANULARITY 1
+    INDEX idx_status response_status TYPE set(100) GRANULARITY 1,
+    INDEX idx_client_name client_name TYPE bloom_filter GRANULARITY 1
 ) ENGINE = MergeTree()
 ORDER BY (host, timestamp, id)
 PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(timestamp))

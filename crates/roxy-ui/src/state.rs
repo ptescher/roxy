@@ -16,8 +16,8 @@ use kube::config::Kubeconfig;
 use kube::discovery::ApiResource;
 use kube::{Api, Client, Config};
 use roxy_core::{
-    ClickHouseConfig, DatabaseQueryRow, HostSummary, HttpRequestRecord, KafkaMessageRow,
-    RoxyClickHouse, TcpConnectionRow,
+    ClickHouseConfig, ClientServiceSummary, DatabaseQueryRow, HostSummary, HttpRequestRecord,
+    KafkaMessageRow, RoxyClickHouse, TcpConnectionRow,
 };
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -57,6 +57,7 @@ impl From<PortForwardEntry> for PortForwardInfo {
             remote_port: entry.remote_port,
             local_port: entry.local_port,
             active: entry.auto_start,
+            connection_count: 0, // Config-based port forwards start with no active connections
         }
     }
 }
@@ -137,6 +138,8 @@ pub enum UiMessage {
     RequestsUpdated(Vec<HttpRequestRecord>),
     /// New hosts summary fetched from ClickHouse
     HostsUpdated(Vec<HostSummary>),
+    /// New client services fetched from ClickHouse
+    ServicesUpdated(Vec<ClientServiceSummary>),
     /// New TCP connections fetched from ClickHouse
     ConnectionsUpdated(Vec<TcpConnectionRow>),
     /// New database queries fetched from ClickHouse
@@ -167,6 +170,8 @@ pub enum UiMessage {
     KubeLoadingComplete,
     /// Kubernetes client failed to initialize
     KubeClientFailed(String),
+    /// Active K8s connections updated from proxy (for showing port forwards in the graph)
+    ActiveK8sConnectionsUpdated(Vec<PortForwardInfo>),
 }
 
 /// Proxy server status
@@ -482,6 +487,18 @@ impl AppState {
             UiMessage::HostsUpdated(hosts) => {
                 self.hosts = hosts;
             }
+            UiMessage::ServicesUpdated(client_services) => {
+                // Convert ClientServiceSummary to ServiceSummary for UI
+                self.services = client_services
+                    .into_iter()
+                    .map(|cs| ServiceSummary {
+                        name: cs.client_name,
+                        request_count: cs.request_count,
+                        connection_count: 0, // TCP connections tracked separately
+                        avg_duration_ms: cs.avg_duration_ms,
+                    })
+                    .collect();
+            }
             UiMessage::ConnectionsUpdated(connections) => {
                 self.tcp_connections = connections;
             }
@@ -532,6 +549,39 @@ impl AppState {
                 self.error_message = Some(format!("Kubernetes: {}", err));
                 warn!("Kubernetes client failed: {}", err);
             }
+            UiMessage::ActiveK8sConnectionsUpdated(active_connections) => {
+                // Merge active connections from proxy with config-based port forwards
+                let mut all_forwards = active_connections;
+
+                if !all_forwards.is_empty() {
+                    info!(
+                        "Received {} active K8s connections from proxy",
+                        all_forwards.len()
+                    );
+                    for pf in &all_forwards {
+                        debug!(
+                            "  Active K8s: {} -> {}:{}",
+                            pf.service_dns, pf.namespace, pf.remote_port
+                        );
+                    }
+                }
+
+                // Add config-based port forwards that aren't already active
+                for pf in load_port_forwards_config() {
+                    if !all_forwards
+                        .iter()
+                        .any(|a| a.service_dns == pf.service_dns && a.remote_port == pf.remote_port)
+                    {
+                        all_forwards.push(pf);
+                    }
+                }
+
+                debug!(
+                    "Total port forwards (active + config): {}",
+                    all_forwards.len()
+                );
+                self.k8s_port_forwards = all_forwards;
+            }
         }
     }
 
@@ -573,12 +623,24 @@ impl AppState {
         self.selected_host = None;
     }
 
-    /// Get filtered requests based on selected host
+    /// Get filtered requests based on selected host and/or service
     pub fn filtered_requests(&self) -> Vec<&HttpRequestRecord> {
-        match &self.selected_host {
-            Some(host) => self.requests.iter().filter(|r| &r.host == host).collect(),
-            None => self.requests.iter().collect(),
-        }
+        self.requests
+            .iter()
+            .filter(|r| {
+                // Filter by host if selected
+                let host_match = match &self.selected_host {
+                    Some(host) => &r.host == host,
+                    None => true,
+                };
+                // Filter by service (client_name) if selected
+                let service_match = match &self.selected_service {
+                    Some(service) => &r.client_name == service,
+                    None => true,
+                };
+                host_match && service_match
+            })
+            .collect()
     }
 
     /// Set the active detail tab
