@@ -16,6 +16,8 @@ pub enum MessagingDetailTab {
     /// Overview of the message
     #[default]
     Overview,
+    /// Message payload/content
+    Payload,
     /// Message metadata and attributes
     Metadata,
     /// Error details (if any)
@@ -26,6 +28,7 @@ impl MessagingDetailTab {
     pub fn label(&self) -> &'static str {
         match self {
             MessagingDetailTab::Overview => "Overview",
+            MessagingDetailTab::Payload => "Payload",
             MessagingDetailTab::Metadata => "Metadata",
             MessagingDetailTab::Error => "Error",
         }
@@ -34,6 +37,7 @@ impl MessagingDetailTab {
     pub fn all() -> &'static [MessagingDetailTab] {
         &[
             MessagingDetailTab::Overview,
+            MessagingDetailTab::Payload,
             MessagingDetailTab::Metadata,
             MessagingDetailTab::Error,
         ]
@@ -179,6 +183,7 @@ impl MessagingDetailPanel {
     fn render_message_details(&self, msg: &KafkaMessageRow) -> impl IntoElement {
         match self.props.active_tab {
             MessagingDetailTab::Overview => self.render_overview(msg).into_any_element(),
+            MessagingDetailTab::Payload => self.render_payload_tab(msg).into_any_element(),
             MessagingDetailTab::Metadata => self.render_metadata_tab(msg).into_any_element(),
             MessagingDetailTab::Error => self.render_error_tab(msg).into_any_element(),
         }
@@ -291,6 +296,76 @@ impl MessagingDetailPanel {
                         )),
                 ),
             )
+    }
+
+    /// Render the payload tab (message content)
+    fn render_payload_tab(&self, msg: &KafkaMessageRow) -> impl IntoElement {
+        // Try to parse and display the attributes as the payload
+        // In Kafka, the actual message content is typically stored in attributes
+        let payload_content = if !msg.attributes.is_empty() && msg.attributes != "{}" {
+            format_json(&msg.attributes)
+        } else {
+            String::new()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .p(spacing::MD)
+            .gap(spacing::MD)
+            // Message Info section
+            .child(
+                self.render_section(
+                    "Message Info",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(spacing::SM)
+                        .child(self.render_field("Topic", msg.messaging_destination.clone()))
+                        .child(self.render_field("Operation", msg.messaging_operation.clone()))
+                        .child(self.render_field("Message Count", msg.message_count.to_string()))
+                        .child(
+                            self.render_field(
+                                "Payload Size",
+                                format_bytes(msg.payload_size as u64),
+                            ),
+                        ),
+                ),
+            )
+            // Payload Content section
+            .child(self.render_section(
+                "Payload Content",
+                if payload_content.is_empty() {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .py(spacing::LG)
+                        .child(
+                            div()
+                                .text_size(font_size::SM)
+                                .text_color(self.theme.text_muted)
+                                .child("No payload data captured"),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .p(spacing::MD)
+                        .bg(rgb(colors::BASE))
+                        .rounded(dimensions::BORDER_RADIUS)
+                        .border_1()
+                        .border_color(rgb(colors::SURFACE_0))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .text_size(font_size::SM)
+                                .font_family("monospace")
+                                .text_color(self.theme.text_primary)
+                                .child(payload_content),
+                        )
+                        .into_any_element()
+                },
+            ))
     }
 
     /// Render the metadata tab (Kafka-specific details)
