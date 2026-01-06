@@ -7,11 +7,13 @@
 //!
 //! This approach avoids certificate issues with iOS/mobile apps.
 
+pub mod gateway;
 pub mod kubectl;
 pub mod process;
 pub mod protocol;
 pub mod socks;
 
+pub use gateway::GatewayRouter;
 pub use kubectl::{K8sService, K8sStream, KubectlPortForwardManager};
 pub use process::{identify_process, ProcessInfo};
 pub use socks::{SocksConfig, SocksProxy, DEFAULT_SOCKS_PORT};
@@ -196,6 +198,10 @@ struct ProxyState {
     tunnel_count: AtomicU64,
     /// Kubectl port-forward manager for K8s service routing
     kubectl_manager: tokio::sync::Mutex<KubectlPortForwardManager>,
+    /// Gateway router for HTTPRoute-based routing
+    gateway_router: tokio::sync::Mutex<GatewayRouter>,
+    /// Shared state for tracking active K8s connections (for UI display)
+    active_k8s_connections: Arc<ActiveK8sConnections>,
 }
 
 /// HTTP body type alias
@@ -419,44 +425,109 @@ async fn handle_http_forward(
         "Forwarding request"
     );
 
-    // Connect to target - check if this is a K8s service
+    // Connect to target - first try HTTPRoute resolution, then K8s DNS, then direct
     let target_addr = format!("{}:{}", host, port);
-    let is_k8s = KubectlPortForwardManager::is_k8s_service(&host);
 
-    // Determine the actual address to connect to
-    let connect_addr = if is_k8s {
-        if let Some(k8s_service) = K8sService::from_dns_name(&host, port) {
-            info!(
-                request_id = %request_id,
-                service = %k8s_service.name,
-                namespace = %k8s_service.namespace,
-                port = port,
-                "Routing HTTP request to K8s service via port-forward"
-            );
-            let mut manager = state.kubectl_manager.lock().await;
-            match manager.get_or_create_forward(k8s_service).await {
-                Ok(local_addr) => {
+    // Try to resolve via HTTPRoute first
+    let gateway_result = {
+        let mut router = state.gateway_router.lock().await;
+        router.resolve(&host, &path, &method, &parts.headers).await
+    };
+
+    let connect_addr = match gateway_result {
+        Ok(Some((backend_dns, backend_port))) => {
+            // HTTPRoute matched - route to the backend service via port-forward
+            if let Some(k8s_service) = K8sService::from_dns_name(&backend_dns, backend_port) {
+                info!(
+                    request_id = %request_id,
+                    route_host = %host,
+                    service = %k8s_service.name,
+                    namespace = %k8s_service.namespace,
+                    port = backend_port,
+                    "Routing via HTTPRoute to K8s service"
+                );
+                // Track this K8s connection for UI display
+                state
+                    .active_k8s_connections
+                    .add_connection(&k8s_service)
+                    .await;
+
+                let mut manager = state.kubectl_manager.lock().await;
+                match manager.get_or_create_forward(k8s_service).await {
+                    Ok(local_addr) => {
+                        info!(
+                            request_id = %request_id,
+                            local_addr = %local_addr,
+                            "K8s port-forward ready via HTTPRoute"
+                        );
+                        local_addr.to_string()
+                    }
+                    Err(e) => {
+                        error!(
+                            request_id = %request_id,
+                            error = %e,
+                            "Failed to create K8s port-forward for HTTPRoute backend"
+                        );
+                        target_addr.clone()
+                    }
+                }
+            } else {
+                // Backend is not a K8s service DNS, try direct connection
+                format!("{}:{}", backend_dns, backend_port)
+            }
+        }
+        Ok(None) => {
+            // No HTTPRoute match - check if this is a direct K8s service DNS
+            let is_k8s = KubectlPortForwardManager::is_k8s_service(&host);
+            if is_k8s {
+                if let Some(k8s_service) = K8sService::from_dns_name(&host, port) {
                     info!(
                         request_id = %request_id,
-                        local_addr = %local_addr,
-                        "K8s port-forward ready, connecting to local address"
+                        service = %k8s_service.name,
+                        namespace = %k8s_service.namespace,
+                        port = port,
+                        "Routing HTTP request to K8s service via port-forward"
                     );
-                    local_addr.to_string()
-                }
-                Err(e) => {
-                    error!(
-                        request_id = %request_id,
-                        error = %e,
-                        "Failed to create K8s port-forward"
-                    );
+                    // Track this K8s connection for UI display
+                    state
+                        .active_k8s_connections
+                        .add_connection(&k8s_service)
+                        .await;
+
+                    let mut manager = state.kubectl_manager.lock().await;
+                    match manager.get_or_create_forward(k8s_service).await {
+                        Ok(local_addr) => {
+                            info!(
+                                request_id = %request_id,
+                                local_addr = %local_addr,
+                                "K8s port-forward ready, connecting to local address"
+                            );
+                            local_addr.to_string()
+                        }
+                        Err(e) => {
+                            error!(
+                                request_id = %request_id,
+                                error = %e,
+                                "Failed to create K8s port-forward"
+                            );
+                            target_addr.clone()
+                        }
+                    }
+                } else {
                     target_addr.clone()
                 }
+            } else {
+                target_addr.clone()
             }
-        } else {
+        }
+        Err(e) => {
+            warn!(
+                request_id = %request_id,
+                error = %e,
+                "HTTPRoute resolution failed, falling back to direct connection"
+            );
             target_addr.clone()
         }
-    } else {
-        target_addr.clone()
     };
 
     match TcpStream::connect(&connect_addr).await {
@@ -787,6 +858,8 @@ impl ProxyServer {
             request_count: AtomicU64::new(0),
             tunnel_count: AtomicU64::new(0),
             kubectl_manager: tokio::sync::Mutex::new(KubectlPortForwardManager::new()),
+            gateway_router: tokio::sync::Mutex::new(GatewayRouter::new()),
+            active_k8s_connections: active_k8s_connections.clone(),
         });
 
         // Create SOCKS5 proxy if enabled, with ClickHouse for protocol interception

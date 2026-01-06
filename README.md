@@ -89,6 +89,55 @@ SOCKS5_PROXY=socks5://127.0.0.1:1080 npm run start:dev
 - `service.namespace.svc.cluster.local` (full format)
 - `service.namespace.svc` (short format)
 
+### Gateway API / HTTPRoute Support
+
+Roxy can route HTTP traffic based on Kubernetes Gateway API HTTPRoute resources. When you make a request through the proxy, Roxy checks your cluster's HTTPRoute definitions and forwards traffic to the appropriate backend service.
+
+**Example:**
+
+If you have an HTTPRoute in your cluster like:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: orders-route
+  namespace: production
+spec:
+  hostnames:
+    - "api.example.com"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /orders
+      backendRefs:
+        - name: orders-service
+          port: 8080
+```
+
+Then running:
+
+```bash
+curl --proxy localhost:8080 http://api.example.com/orders
+```
+
+Will automatically:
+1. Fetch HTTPRoute resources from your cluster
+2. Match the hostname and path against route rules
+3. Port-forward to the `orders-service` pod in the `production` namespace
+4. Forward your request to the service
+
+This enables local development against your API gateway configuration without deploying code or modifying DNS.
+
+**Supported HTTPRoute features:**
+- Hostname matching (exact and wildcard `*.example.com`)
+- Path matching (Exact, PathPrefix, RegularExpression)
+- Header matching
+- Method matching
+- Weighted backend selection for traffic splitting
+- Routes are cached and refreshed every 30 seconds
+
 ### How It Works
 
 When you launch Roxy:
