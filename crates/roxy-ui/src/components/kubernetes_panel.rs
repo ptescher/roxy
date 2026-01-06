@@ -100,7 +100,10 @@ pub struct PortForwardInfo {
     pub service_name: String,
     pub remote_port: u16,
     pub local_port: u16,
+    /// Whether this is from an active proxy connection (vs config file)
     pub active: bool,
+    /// Number of currently active connections (0 means recently used but not currently connected)
+    pub connection_count: u32,
 }
 
 /// HTTPRoute info (legacy - kept for compatibility)
@@ -143,6 +146,8 @@ pub struct KubernetesPanelProps {
 // =============================================================================
 // Panel Component
 // =============================================================================
+
+use tracing::{debug, info};
 
 /// Kubernetes Panel component
 pub struct KubernetesPanel {
@@ -266,6 +271,24 @@ impl KubernetesPanel {
         let has_port_forwards = !self.props.port_forwards.is_empty();
         let has_data = has_ingresses || has_routes || has_services || has_port_forwards;
 
+        debug!(
+            "render_flow_diagram: ingresses={}, routes={}, services={}, port_forwards={}, has_data={}",
+            self.props.ingresses.len(),
+            self.props.http_routes.len(),
+            self.props.services.len(),
+            self.props.port_forwards.len(),
+            has_data
+        );
+
+        if has_port_forwards {
+            for pf in &self.props.port_forwards {
+                info!(
+                    "Port forward in props: {} -> {}:{} (active={})",
+                    pf.service_dns, pf.namespace, pf.remote_port, pf.active
+                );
+            }
+        }
+
         if !has_data {
             return self.render_empty_state().into_any_element();
         }
@@ -322,6 +345,10 @@ impl KubernetesPanel {
 
         // Column 0: Add Roxy node if we have port forwards (always one row below Internet with a gap)
         if has_port_forwards {
+            info!(
+                "Adding Roxy node to graph - {} port forwards",
+                self.props.port_forwards.len()
+            );
             // Skip a row to create visual gap between Internet and Roxy
             row_counters[0] += 1;
 
@@ -543,9 +570,18 @@ impl KubernetesPanel {
         }
 
         // Add port forward edges (from Roxy to Services)
+        debug!(
+            "Processing {} port forwards, selected_namespace={:?}",
+            self.props.port_forwards.len(),
+            self.props.selected_namespace
+        );
         for pf in &self.props.port_forwards {
             if let Some(ref ns) = self.props.selected_namespace {
                 if &pf.namespace != ns {
+                    debug!(
+                        "Skipping port forward {} - namespace {} doesn't match {}",
+                        pf.service_dns, pf.namespace, ns
+                    );
                     continue;
                 }
             }
@@ -553,11 +589,32 @@ impl KubernetesPanel {
             let svc_id = GraphNodeId::Service(pf.namespace.clone(), pf.service_name.clone());
             let svc_key = svc_id.key();
 
+            // Determine colors based on whether there are active connections
+            let is_active = pf.connection_count > 0;
+            let node_color = if is_active {
+                colors::TEAL
+            } else {
+                colors::OVERLAY_0
+            };
+            let edge_color = if is_active {
+                colors::TEAL
+            } else {
+                colors::OVERLAY_0
+            };
+
             // Ensure service node exists
             if !added_services.contains(&svc_key) {
+                let sublabel = if is_active {
+                    format!(
+                        "{}:{} ({} conn)",
+                        pf.namespace, pf.remote_port, pf.connection_count
+                    )
+                } else {
+                    format!("{}:{} (recent)", pf.namespace, pf.remote_port)
+                };
                 builder = builder.node(
-                    GraphNode::new(svc_id.clone(), pf.service_name.clone(), "📦", colors::TEAL)
-                        .with_sublabel(format!("{}:{}", pf.namespace, pf.remote_port))
+                    GraphNode::new(svc_id.clone(), pf.service_name.clone(), "📦", node_color)
+                        .with_sublabel(sublabel)
                         .in_namespace(pf.namespace.clone())
                         .at(service_column, row_counters[service_column]),
                 );
@@ -565,10 +622,21 @@ impl KubernetesPanel {
                 row_counters[service_column] += 1;
             }
 
+            info!(
+                "Adding edge: Roxy -> {} ({}:{}) active={} count={}",
+                pf.service_name, pf.namespace, pf.remote_port, is_active, pf.connection_count
+            );
+
+            // Use solid line for active connections, dashed for recent/inactive
+            let edge_style = if is_active {
+                EdgeStyle::solid(edge_color)
+            } else {
+                EdgeStyle::dashed(edge_color)
+            };
             builder = builder.edge(
                 GraphEdge::new(GraphNodeId::Roxy, svc_id)
                     .with_label(format!(":{} → :{}", pf.local_port, pf.remote_port))
-                    .with_style(EdgeStyle::dashed(colors::TEAL)),
+                    .with_style(edge_style),
             );
         }
 

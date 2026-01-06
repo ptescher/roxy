@@ -8,11 +8,135 @@
 //! This approach avoids certificate issues with iOS/mobile apps.
 
 pub mod kubectl;
+pub mod process;
 pub mod protocol;
 pub mod socks;
 
 pub use kubectl::{K8sService, K8sStream, KubectlPortForwardManager};
+pub use process::{identify_process, ProcessInfo};
 pub use socks::{SocksConfig, SocksProxy, DEFAULT_SOCKS_PORT};
+
+use std::collections::HashMap;
+use tokio::sync::RwLock;
+
+/// How long to keep K8s connection entries after the last connection closes
+const K8S_CONNECTION_RETAIN_SECS: i64 = 300; // 5 minutes
+
+/// Information about an active K8s connection through the proxy
+#[derive(Debug, Clone)]
+pub struct ActiveK8sConnectionInfo {
+    /// Service name (e.g., "postgres")
+    pub service_name: String,
+    /// Namespace (e.g., "database")
+    pub namespace: String,
+    /// Remote port
+    pub port: u16,
+    /// Full DNS name
+    pub dns_name: String,
+    /// When the connection was first established
+    pub connected_at: chrono::DateTime<chrono::Utc>,
+    /// When the connection was last used (for cleanup)
+    pub last_used: chrono::DateTime<chrono::Utc>,
+    /// Number of active connections to this service
+    pub connection_count: u32,
+}
+
+impl ActiveK8sConnectionInfo {
+    /// Check if this entry has expired (no active connections and past retention time)
+    pub fn is_expired(&self) -> bool {
+        if self.connection_count > 0 {
+            return false;
+        }
+        let now = chrono::Utc::now();
+        let elapsed = now.signed_duration_since(self.last_used);
+        elapsed.num_seconds() > K8S_CONNECTION_RETAIN_SECS
+    }
+}
+
+/// Shared state for tracking active K8s connections
+///
+/// This is shared between the proxy and UI to show real-time port forward status.
+#[derive(Debug, Default)]
+pub struct ActiveK8sConnections {
+    /// Map of service DNS name to connection info
+    connections: RwLock<HashMap<String, ActiveK8sConnectionInfo>>,
+}
+
+impl ActiveK8sConnections {
+    /// Create a new empty connections tracker
+    pub fn new() -> Self {
+        Self {
+            connections: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Record a new connection to a K8s service
+    pub async fn add_connection(&self, service: &K8sService) {
+        let mut conns = self.connections.write().await;
+        let dns_name = service.dns_name();
+        let now = chrono::Utc::now();
+
+        if let Some(info) = conns.get_mut(&dns_name) {
+            info.connection_count += 1;
+            info.last_used = now;
+        } else {
+            conns.insert(
+                dns_name.clone(),
+                ActiveK8sConnectionInfo {
+                    service_name: service.name.clone(),
+                    namespace: service.namespace.clone(),
+                    port: service.port,
+                    dns_name,
+                    connected_at: now,
+                    last_used: now,
+                    connection_count: 1,
+                },
+            );
+        }
+
+        // Clean up expired entries while we have the lock
+        conns.retain(|_, info| !info.is_expired());
+    }
+
+    /// Record a connection being closed
+    ///
+    /// The entry is kept for 5 minutes after the last connection closes
+    /// to allow the UI to show recently used services and enable reuse.
+    pub async fn remove_connection(&self, service: &K8sService) {
+        let mut conns = self.connections.write().await;
+        let dns_name = service.dns_name();
+
+        if let Some(info) = conns.get_mut(&dns_name) {
+            if info.connection_count > 0 {
+                info.connection_count -= 1;
+            }
+            // Update last_used time - entry will be kept for 5 minutes
+            info.last_used = chrono::Utc::now();
+        }
+
+        // Clean up expired entries while we have the lock
+        conns.retain(|_, info| !info.is_expired());
+    }
+
+    /// Get all active and recent connections (within retention period)
+    pub async fn list(&self) -> Vec<ActiveK8sConnectionInfo> {
+        // First clean up expired entries
+        {
+            let mut conns = self.connections.write().await;
+            conns.retain(|_, info| !info.is_expired());
+        }
+
+        // Then return the remaining entries
+        let conns = self.connections.read().await;
+        conns.values().cloned().collect()
+    }
+
+    /// Get the number of active K8s services
+    pub async fn count(&self) -> usize {
+        let conns = self.connections.read().await;
+        conns.len()
+    }
+}
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -23,7 +147,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use roxy_core::{services::ServiceManager, ClickHouseConfig, HttpRequestRecord, RoxyClickHouse};
-use std::collections::HashMap;
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -181,6 +305,41 @@ async fn handle_connect(
 }
 
 /// Handle regular HTTP forward proxy requests
+/// Extract client application name from request headers
+///
+/// Checks headers in order of preference:
+/// 1. X-Client-Name - explicit client identifier
+/// 2. X-Application-Name - common alternative
+/// 3. User-Agent - fallback, extracts app name before version/details
+fn extract_client_name(headers: &hyper::HeaderMap) -> String {
+    // Check explicit client name headers first
+    if let Some(name) = headers.get("x-client-name") {
+        if let Ok(s) = name.to_str() {
+            return s.to_string();
+        }
+    }
+
+    if let Some(name) = headers.get("x-application-name") {
+        if let Ok(s) = name.to_str() {
+            return s.to_string();
+        }
+    }
+
+    // Fall back to User-Agent, extract the main app name
+    if let Some(ua) = headers.get("user-agent") {
+        if let Ok(s) = ua.to_str() {
+            // Extract first component before / or space
+            // e.g., "MyApp/1.0.0" -> "MyApp", "curl/7.68.0" -> "curl"
+            let name = s.split(|c| c == '/' || c == ' ').next().unwrap_or(s).trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+
+    String::new()
+}
+
 async fn handle_http_forward(
     req: Request<hyper::body::Incoming>,
     client_addr: SocketAddr,
@@ -190,6 +349,15 @@ async fn handle_http_forward(
     let trace_id = format!("{:032x}", rand::random::<u128>());
     let span_id = format!("{:016x}", rand::random::<u64>());
     let timestamp = Utc::now().timestamp_millis();
+
+    // Extract client name from headers before consuming the request
+    let mut client_name = extract_client_name(req.headers());
+
+    // If no client name from headers, try to identify the process
+    let process_info = process::identify_process(&client_addr);
+    if client_name.is_empty() {
+        client_name = process_info.display_name();
+    }
 
     // Extract request metadata
     let method = req.method().to_string();
@@ -380,6 +548,7 @@ async fn handle_http_forward(
                         server_ip: target_addr.clone(),
                         protocol,
                         tls_version: String::new(),
+                        client_name: client_name.clone(),
                     };
 
                     info!(
@@ -594,13 +763,23 @@ pub struct ProxyServer {
     service_manager: ServiceManager,
     state: Arc<ProxyState>,
     running: Arc<AtomicBool>,
-    /// SOCKS5 proxy for TCP connections
+    /// Optional SOCKS proxy for TCP connections
     socks_proxy: Option<Arc<SocksProxy>>,
+    /// Shared state for active K8s connections
+    active_k8s_connections: Arc<ActiveK8sConnections>,
 }
 
 impl ProxyServer {
     /// Create a new proxy server with the given configuration
     pub async fn new(config: ProxyConfig) -> Result<Self> {
+        Self::new_with_connections(config, Arc::new(ActiveK8sConnections::new())).await
+    }
+
+    /// Create a new proxy server with shared K8s connection tracking
+    pub async fn new_with_connections(
+        config: ProxyConfig,
+        active_k8s_connections: Arc<ActiveK8sConnections>,
+    ) -> Result<Self> {
         let clickhouse = RoxyClickHouse::new(config.clickhouse.clone());
 
         let state = Arc::new(ProxyState {
@@ -611,10 +790,12 @@ impl ProxyServer {
         });
 
         // Create SOCKS5 proxy if enabled, with ClickHouse for protocol interception
+        // and shared K8s connection tracking
         let socks_proxy = if config.enable_socks {
-            let socks = SocksProxy::with_clickhouse(
+            let socks = SocksProxy::with_clickhouse_and_tracking(
                 config.socks.clone(),
                 RoxyClickHouse::new(config.clickhouse.clone()),
+                active_k8s_connections.clone(),
             );
             Some(Arc::new(socks))
         } else {
@@ -627,6 +808,7 @@ impl ProxyServer {
             state,
             running: Arc::new(AtomicBool::new(false)),
             socks_proxy,
+            active_k8s_connections,
         })
     }
 
@@ -765,13 +947,19 @@ impl ProxyServer {
     }
 
     /// Get the ClickHouse client for querying data
+    /// Get the ClickHouse client
     pub fn clickhouse(&self) -> &RoxyClickHouse {
         &self.state.clickhouse
     }
 
-    /// Get the SOCKS5 proxy (if enabled)
+    /// Get the SOCKS proxy (if enabled)
     pub fn socks_proxy(&self) -> Option<&Arc<SocksProxy>> {
         self.socks_proxy.as_ref()
+    }
+
+    /// Get the shared active K8s connections tracker
+    pub fn active_k8s_connections(&self) -> &Arc<ActiveK8sConnections> {
+        &self.active_k8s_connections
     }
 
     /// Add a port forward mapping to the SOCKS5 proxy
@@ -842,6 +1030,86 @@ mod tests {
         assert_eq!(config.socks.port, DEFAULT_SOCKS_PORT);
     }
 
+    #[tokio::test]
+    async fn test_active_k8s_connections_add_remove() {
+        let tracker = ActiveK8sConnections::new();
+        let service = K8sService {
+            name: "postgres".to_string(),
+            namespace: "database".to_string(),
+            port: 5432,
+        };
+
+        // Initially empty
+        assert_eq!(tracker.count().await, 0);
+
+        // Add a connection
+        tracker.add_connection(&service).await;
+        assert_eq!(tracker.count().await, 1);
+
+        let conns = tracker.list().await;
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].service_name, "postgres");
+        assert_eq!(conns[0].namespace, "database");
+        assert_eq!(conns[0].port, 5432);
+        assert_eq!(conns[0].connection_count, 1);
+
+        // Add another connection to the same service
+        tracker.add_connection(&service).await;
+        assert_eq!(tracker.count().await, 1); // Still 1 service
+        let conns = tracker.list().await;
+        assert_eq!(conns[0].connection_count, 2);
+
+        // Remove one connection
+        tracker.remove_connection(&service).await;
+        assert_eq!(tracker.count().await, 1);
+        let conns = tracker.list().await;
+        assert_eq!(conns[0].connection_count, 1);
+
+        // Remove the last connection - entry is kept for 5 minutes
+        tracker.remove_connection(&service).await;
+        assert_eq!(tracker.count().await, 1); // Entry still exists
+        let conns = tracker.list().await;
+        assert_eq!(conns[0].connection_count, 0); // But with 0 active connections
+    }
+
+    #[tokio::test]
+    async fn test_active_k8s_connections_multiple_services() {
+        let tracker = ActiveK8sConnections::new();
+        let postgres = K8sService {
+            name: "postgres".to_string(),
+            namespace: "database".to_string(),
+            port: 5432,
+        };
+        let kafka = K8sService {
+            name: "kafka".to_string(),
+            namespace: "messaging".to_string(),
+            port: 9092,
+        };
+
+        tracker.add_connection(&postgres).await;
+        tracker.add_connection(&kafka).await;
+
+        assert_eq!(tracker.count().await, 2);
+
+        let conns = tracker.list().await;
+        assert_eq!(conns.len(), 2);
+
+        // Remove one - entry is kept for 5 minutes with connection_count = 0
+        tracker.remove_connection(&postgres).await;
+        assert_eq!(tracker.count().await, 2); // Both entries still exist
+
+        let conns = tracker.list().await;
+        assert_eq!(conns.len(), 2);
+
+        // Find the postgres entry and verify it has 0 connections
+        let postgres_conn = conns.iter().find(|c| c.service_name == "postgres").unwrap();
+        assert_eq!(postgres_conn.connection_count, 0);
+
+        // Kafka should still have 1 connection
+        let kafka_conn = conns.iter().find(|c| c.service_name == "kafka").unwrap();
+        assert_eq!(kafka_conn.connection_count, 1);
+    }
+
     #[test]
     fn test_headers_to_json() {
         let mut headers = hyper::HeaderMap::new();
@@ -862,5 +1130,50 @@ mod tests {
         let empty = Bytes::new();
         let result = body_to_string(&empty);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_extract_client_name_x_client_name() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-client-name", "my-frontend".parse().unwrap());
+        headers.insert("user-agent", "curl/7.68.0".parse().unwrap());
+
+        let name = extract_client_name(&headers);
+        assert_eq!(name, "my-frontend");
+    }
+
+    #[test]
+    fn test_extract_client_name_x_application_name() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-application-name", "backend-api".parse().unwrap());
+        headers.insert("user-agent", "curl/7.68.0".parse().unwrap());
+
+        let name = extract_client_name(&headers);
+        assert_eq!(name, "backend-api");
+    }
+
+    #[test]
+    fn test_extract_client_name_user_agent() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("user-agent", "MyApp/1.0.0".parse().unwrap());
+
+        let name = extract_client_name(&headers);
+        assert_eq!(name, "MyApp");
+    }
+
+    #[test]
+    fn test_extract_client_name_user_agent_with_space() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("user-agent", "Mozilla compatible".parse().unwrap());
+
+        let name = extract_client_name(&headers);
+        assert_eq!(name, "Mozilla");
+    }
+
+    #[test]
+    fn test_extract_client_name_empty() {
+        let headers = hyper::HeaderMap::new();
+        let name = extract_client_name(&headers);
+        assert_eq!(name, "");
     }
 }

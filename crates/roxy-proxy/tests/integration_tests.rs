@@ -40,6 +40,7 @@ fn create_test_request(method: &str, url: &str, status: u16) -> HttpRequestRecor
         server_ip: "93.184.216.34".to_string(),
         protocol: "HTTP/1.1".to_string(),
         tls_version: "TLSv1.3".to_string(),
+        client_name: "test-client".to_string(),
     }
 }
 

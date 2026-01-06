@@ -22,8 +22,9 @@ pub use models::{
 };
 
 pub use clickhouse::{
-    ClickHouseConfig, ConnectionStatus, DatabaseQueryRow, HostSummary, HttpRequestRecord,
-    KafkaMessageRow, RoxyClickHouse, SpanRecord, TcpConnectionRow,
+    ActiveK8sConnection, ClickHouseConfig, ClientServiceSummary, ConnectionStatus,
+    DatabaseQueryRow, HostSummary, HttpRequestRecord, KafkaMessageRow, RoxyClickHouse, SpanRecord,
+    TcpConnectionRow,
 };
 
 pub use services::{ManagedService, ServiceManager};

@@ -19,6 +19,7 @@
 use crate::kubectl::{K8sService, KubectlPortForwardManager};
 use crate::protocol::run_intercepting_tunnel_generic;
 use crate::protocol::{run_intercepting_tunnel, InterceptConfig, Protocol};
+use crate::ActiveK8sConnections;
 use roxy_core::RoxyClickHouse;
 use std::collections::HashMap;
 use std::io;
@@ -239,11 +240,21 @@ pub struct SocksProxy {
     clickhouse: Option<Arc<RoxyClickHouse>>,
     /// Configuration for protocol interception
     intercept_config: InterceptConfig,
+    /// Shared tracker for active K8s connections (shared with UI)
+    active_k8s_connections: Arc<ActiveK8sConnections>,
 }
 
 impl SocksProxy {
     /// Create a new SOCKS5 proxy with the given configuration
     pub fn new(config: SocksConfig) -> Self {
+        Self::with_k8s_tracking(config, Arc::new(ActiveK8sConnections::new()))
+    }
+
+    /// Create a new SOCKS5 proxy with shared K8s connection tracking
+    pub fn with_k8s_tracking(
+        config: SocksConfig,
+        active_k8s_connections: Arc<ActiveK8sConnections>,
+    ) -> Self {
         Self {
             config,
             port_forwards: Arc::new(RwLock::new(HashMap::new())),
@@ -251,6 +262,7 @@ impl SocksProxy {
             kubectl_manager: Arc::new(RwLock::new(KubectlPortForwardManager::new())),
             clickhouse: None,
             intercept_config: InterceptConfig::default(),
+            active_k8s_connections,
         }
     }
 
@@ -261,6 +273,19 @@ impl SocksProxy {
 
     /// Create a new SOCKS5 proxy with ClickHouse support for protocol recording
     pub fn with_clickhouse(config: SocksConfig, clickhouse: RoxyClickHouse) -> Self {
+        Self::with_clickhouse_and_tracking(
+            config,
+            clickhouse,
+            Arc::new(ActiveK8sConnections::new()),
+        )
+    }
+
+    /// Create a new SOCKS5 proxy with ClickHouse and shared K8s connection tracking
+    pub fn with_clickhouse_and_tracking(
+        config: SocksConfig,
+        clickhouse: RoxyClickHouse,
+        active_k8s_connections: Arc<ActiveK8sConnections>,
+    ) -> Self {
         Self {
             config,
             port_forwards: Arc::new(RwLock::new(HashMap::new())),
@@ -268,6 +293,7 @@ impl SocksProxy {
             kubectl_manager: Arc::new(RwLock::new(KubectlPortForwardManager::new())),
             clickhouse: Some(Arc::new(clickhouse)),
             intercept_config: InterceptConfig::default(),
+            active_k8s_connections,
         }
     }
 
@@ -294,6 +320,11 @@ impl SocksProxy {
     pub async fn remove_port_forward(&self, dns_name: &str) {
         let mut forwards = self.port_forwards.write().await;
         forwards.remove(dns_name);
+    }
+
+    /// Get the active K8s connections tracker
+    pub fn active_k8s_connections(&self) -> &Arc<ActiveK8sConnections> {
+        &self.active_k8s_connections
     }
 
     /// Get all port forward mappings
@@ -395,6 +426,7 @@ impl SocksProxy {
                     let kubectl_manager = self.kubectl_manager.clone();
                     let clickhouse = self.clickhouse.clone();
                     let intercept_config = self.intercept_config.clone();
+                    let active_k8s_connections = self.active_k8s_connections.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = handle_client(
@@ -406,6 +438,7 @@ impl SocksProxy {
                             kubectl_manager,
                             clickhouse,
                             intercept_config,
+                            active_k8s_connections,
                         )
                         .await
                         {
@@ -433,8 +466,9 @@ async fn handle_client(
     kubectl_manager: Arc<RwLock<KubectlPortForwardManager>>,
     clickhouse: Option<Arc<RoxyClickHouse>>,
     intercept_config: InterceptConfig,
+    active_k8s_connections: Arc<ActiveK8sConnections>,
 ) -> Result<(), SocksError> {
-    debug!("New SOCKS5 connection from {}", client_addr);
+    info!("New SOCKS5 connection from {}", client_addr);
 
     // Step 1: Handle authentication negotiation
     let auth_method = negotiate_auth(&mut stream, &config).await?;
@@ -447,10 +481,21 @@ async fn handle_client(
 
     // Step 3: Handle the request
     let (command, target_addr, target_port) = read_request(&mut stream).await?;
-    debug!(
-        "SOCKS5 request: {:?} to {}:{}",
-        command, target_addr, target_port
+    info!(
+        "SOCKS5 request: {:?} to {}:{} (addr_type={:?})",
+        command,
+        target_addr,
+        target_port,
+        std::mem::discriminant(&target_addr)
     );
+
+    // Log whether this looks like a K8s service
+    if let TargetAddr::Domain(ref domain) = target_addr {
+        let is_k8s = domain.ends_with(".svc.cluster.local") || domain.ends_with(".svc");
+        info!("SOCKS5 target is domain '{}', is_k8s={}", domain, is_k8s);
+    } else {
+        info!("SOCKS5 target is IP address, not a K8s service");
+    }
 
     // We only support CONNECT for now
     if command != Command::Connect {
@@ -460,8 +505,9 @@ async fn handle_client(
 
     // Check if this is a Kubernetes service - use direct stream to avoid race condition
     if let TargetAddr::Domain(domain) = &target_addr {
+        info!("Checking if '{}' is a K8s service...", domain);
         if let Some(k8s_service) = K8sService::from_dns_name(domain, target_port) {
-            debug!(
+            info!(
                 "Detected K8s service: {}.{} port {} - using direct stream",
                 k8s_service.name, k8s_service.namespace, k8s_service.port
             );
@@ -469,11 +515,22 @@ async fn handle_client(
             // Get a direct stream from Kubernetes (this waits for the connection to be ready)
             // We acquire the write lock only for the duration of getting the K8sStream,
             // then release it before running the tunnel to avoid blocking other connections.
+            let k8s_service_clone = k8s_service.clone();
             let mut k8s_stream = {
                 let mut manager = kubectl_manager.write().await;
                 manager.get_direct_stream(k8s_service).await?
                 // Manager lock is dropped here
             };
+
+            // Track this K8s connection
+            active_k8s_connections
+                .add_connection(&k8s_service_clone)
+                .await;
+            info!(
+                "K8s connection tracked: {} (active count: {})",
+                k8s_service_clone.dns_name(),
+                active_k8s_connections.count().await
+            );
             trace!("Released kubectl_manager write lock");
 
             // Take the stream - this must succeed since we just created it
@@ -520,7 +577,15 @@ async fn handle_client(
                 intercept_stats.protocol
             );
 
-            // Clean up the K8s stream
+            // Clean up the K8s stream and remove from tracking
+            active_k8s_connections
+                .remove_connection(&k8s_service_clone)
+                .await;
+            info!(
+                "K8s connection removed: {} (remaining: {})",
+                k8s_service_clone.dns_name(),
+                active_k8s_connections.count().await
+            );
             if let Err(e) = k8s_stream.join().await {
                 debug!("K8s stream join error (may be expected): {}", e);
             }

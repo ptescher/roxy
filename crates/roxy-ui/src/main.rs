@@ -21,7 +21,7 @@ use cocoa::{
 #[cfg(target_os = "macos")]
 use objc::{class, msg_send, sel, sel_impl};
 
-use roxy_proxy::{system_proxy, ProxyConfig, ProxyServer};
+use roxy_proxy::{system_proxy, ActiveK8sConnections, ProxyConfig, ProxyServer};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,6 +89,11 @@ impl RoxyApp {
 
         tracing::info!("Starting embedded proxy server...");
 
+        // Create shared state for active K8s connections (shared between proxy and UI)
+        let active_k8s_connections = Arc::new(ActiveK8sConnections::new());
+        let active_k8s_for_proxy = active_k8s_connections.clone();
+        let active_k8s_for_poller = active_k8s_connections.clone();
+
         // Start the proxy in a background thread with its own tokio runtime
         let proxy_tx = message_tx.clone();
         std::thread::spawn(move || {
@@ -99,7 +104,7 @@ impl RoxyApp {
                     ..Default::default()
                 };
 
-                match ProxyServer::new(config).await {
+                match ProxyServer::new_with_connections(config, active_k8s_for_proxy).await {
                     Ok(mut server) => {
                         if let Err(e) = server.setup_services().await {
                             tracing::error!("Failed to setup services: {}", e);
@@ -129,12 +134,13 @@ impl RoxyApp {
             });
         });
 
-        // Start background polling for ClickHouse data
+        // Start background polling for ClickHouse data and active K8s connections
         let poll_tx = message_tx.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create polling runtime");
             rt.block_on(async move {
                 let clickhouse = RoxyClickHouse::new(ClickHouseConfig::default());
+                let active_k8s = active_k8s_for_poller;
 
                 // Wait for services to start
                 tracing::info!("[POLLER] ClickHouse poller waiting for services to start...");
@@ -198,6 +204,28 @@ impl RoxyApp {
                         }
                     }
 
+                    // Poll for client services (apps connecting TO roxy)
+                    tracing::debug!("[POLLER] Poll #{}: Querying client services...", poll_count);
+                    match clickhouse.get_client_services().await {
+                        Ok(services) => {
+                            tracing::info!(
+                                "[POLLER] Poll #{}: SUCCESS - Got {} client services from ClickHouse",
+                                poll_count,
+                                services.len()
+                            );
+                            if let Err(e) = poll_tx.send(UiMessage::ServicesUpdated(services)) {
+                                tracing::error!("[POLLER] Failed to send services to UI: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[POLLER] Poll #{}: FAILED to fetch client services: {:?}",
+                                poll_count,
+                                e
+                            );
+                        }
+                    }
+
                     // Poll for TCP connections (unknown protocols only)
                     tracing::debug!("[POLLER] Poll #{}: Querying TCP connections...", poll_count);
                     match clickhouse.get_recent_connections(100).await {
@@ -254,6 +282,50 @@ impl RoxyApp {
                                 e
                             );
                         }
+                    }
+
+                    // Poll for active K8s connections from proxy (for showing port forwards in the graph)
+                    let active_connections = active_k8s.list().await;
+                    let conn_count = active_connections.len();
+                    if conn_count > 0 {
+                        tracing::info!(
+                            "[POLLER] Poll #{}: Found {} active K8s connections:",
+                            poll_count,
+                            conn_count
+                        );
+                        for conn in &active_connections {
+                            tracing::info!(
+                                "[POLLER]   - {} ({}:{}) - {} connection(s)",
+                                conn.dns_name,
+                                conn.namespace,
+                                conn.port,
+                                conn.connection_count
+                            );
+                        }
+                    } else {
+                        tracing::trace!(
+                            "[POLLER] Poll #{}: No active K8s connections",
+                            poll_count
+                        );
+                    }
+                    let port_forwards: Vec<_> = active_connections
+                        .into_iter()
+                        .map(|conn| crate::components::PortForwardInfo {
+                            service_dns: conn.dns_name,
+                            namespace: conn.namespace,
+                            service_name: conn.service_name,
+                            remote_port: conn.port,
+                            local_port: 0, // SOCKS uses direct connections
+                            active: true,
+                            connection_count: conn.connection_count,
+                        })
+                        .collect();
+                    tracing::debug!(
+                        "[POLLER] Sending {} port forwards to UI",
+                        port_forwards.len()
+                    );
+                    if let Err(e) = poll_tx.send(UiMessage::ActiveK8sConnectionsUpdated(port_forwards)) {
+                        tracing::error!("[POLLER] Failed to send K8s connections to UI: {}", e);
                     }
 
                     // Poll for Kafka messages
@@ -1213,6 +1285,12 @@ fn main() {
 
         cx.on_action(|_: &CloseWindow, cx| {
             // For a single-window app, closing the window quits
+            // Clear system proxy before quitting to restore network settings
+            if let Err(e) = system_proxy::clear_system_proxy() {
+                tracing::error!("Failed to clear system proxy on close: {}", e);
+            } else {
+                tracing::info!("System proxy cleared on close");
+            }
             cx.quit();
         });
 
