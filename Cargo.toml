@@ -4,6 +4,7 @@ members = [
     "crates/roxy-proxy",
     "crates/roxy-ui",
     "crates/roxy-core",
+    "crates/roxy-mcp",
 ]
 
 [workspace.package]

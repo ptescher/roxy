@@ -18,6 +18,9 @@ pub use kubectl::{K8sService, K8sStream, KubectlPortForwardManager};
 pub use process::{identify_process, ProcessInfo};
 pub use socks::{SocksConfig, SocksProxy, DEFAULT_SOCKS_PORT};
 
+// Re-export MCP types
+pub use roxy_mcp::{SseMcpServer, SseServerConfig as McpConfig, DEFAULT_MCP_SSE_PORT};
+
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 
@@ -175,6 +178,10 @@ pub struct ProxyConfig {
     pub enable_socks: bool,
     /// SOCKS5 proxy configuration
     pub socks: SocksConfig,
+    /// Whether to enable MCP server
+    pub enable_mcp: bool,
+    /// MCP server configuration
+    pub mcp: McpConfig,
 }
 
 impl Default for ProxyConfig {
@@ -186,6 +193,8 @@ impl Default for ProxyConfig {
             clickhouse: ClickHouseConfig::default(),
             enable_socks: true,
             socks: SocksConfig::default(),
+            enable_mcp: true,
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -838,6 +847,8 @@ pub struct ProxyServer {
     socks_proxy: Option<Arc<SocksProxy>>,
     /// Shared state for active K8s connections
     active_k8s_connections: Arc<ActiveK8sConnections>,
+    /// Optional MCP server for AI agent integration
+    mcp_server: Option<SseMcpServer>,
 }
 
 impl ProxyServer {
@@ -882,6 +893,7 @@ impl ProxyServer {
             running: Arc::new(AtomicBool::new(false)),
             socks_proxy,
             active_k8s_connections,
+            mcp_server: None,
         })
     }
 
@@ -930,8 +942,20 @@ impl ProxyServer {
     }
 
     /// Run the proxy server
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         self.running.store(true, Ordering::SeqCst);
+
+        // Start MCP server if enabled
+        if self.config.enable_mcp {
+            match roxy_mcp::run_sse(self.config.mcp.clone()).await {
+                Ok(mcp_server) => {
+                    self.mcp_server = Some(mcp_server);
+                }
+                Err(e) => {
+                    warn!("Failed to start MCP server: {}", e);
+                }
+            }
+        }
 
         let addr = SocketAddr::from(([127, 0, 0, 1], self.config.port));
         let listener = TcpListener::bind(addr)
@@ -961,6 +985,12 @@ impl ProxyServer {
             info!(
                 "  SOCKS5:     socks5://127.0.0.1:{}",
                 self.config.socks.port
+            );
+        }
+        if self.config.enable_mcp {
+            info!(
+                "  MCP:        http://127.0.0.1:{}/sse",
+                self.config.mcp.bind_address.port()
             );
         }
         info!("  ClickHouse: http://127.0.0.1:8123");
@@ -1056,6 +1086,12 @@ impl ProxyServer {
 
     /// Stop backend services
     pub async fn stop_services(&mut self) -> Result<()> {
+        // Stop MCP server if running
+        if let Some(mcp_server) = self.mcp_server.take() {
+            info!("Stopping MCP server...");
+            mcp_server.stop().await;
+        }
+
         if self.config.start_services {
             self.service_manager
                 .stop_all()

@@ -346,6 +346,34 @@ impl RoxyClickHouse {
         Ok(requests.into_iter().next())
     }
 
+    /// Search HTTP requests by query string
+    ///
+    /// Searches across URL, path, host, and request/response bodies
+    pub async fn search_requests(&self, query: &str, limit: u32) -> Result<Vec<HttpRequestRecord>> {
+        let pattern = format!("%{}%", query);
+        let requests = self
+            .client
+            .query(
+                r"SELECT * FROM http_requests
+                WHERE url LIKE ?
+                   OR path LIKE ?
+                   OR host LIKE ?
+                   OR request_body LIKE ?
+                   OR response_body LIKE ?
+                ORDER BY timestamp DESC
+                LIMIT ?",
+            )
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(limit)
+            .fetch_all::<HttpRequestRecord>()
+            .await?;
+        Ok(requests)
+    }
+
     /// Insert a database query record
     pub async fn insert_database_query(&self, record: &DatabaseQueryRow) -> Result<()> {
         let query = format!(

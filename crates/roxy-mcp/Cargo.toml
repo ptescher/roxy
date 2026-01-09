@@ -1,0 +1,48 @@
+[package]
+name = "roxy-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP (Model Context Protocol) server for Roxy network debugger"
+
+[lib]
+name = "roxy_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "roxy-mcp"
+path = "src/main.rs"
+
+[features]
+default = ["stdio"]
+stdio = ["rmcp/transport-io"]
+sse = ["rmcp/transport-sse-server"]
+
+[dependencies]
+# MCP SDK
+rmcp = { version = "0.1", features = ["server"] }
+
+# Core crate for ClickHouse access and types
+roxy-core = { path = "../roxy-core" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# For SSE server
+tokio-util = "0.7"
+futures = { workspace = true }
