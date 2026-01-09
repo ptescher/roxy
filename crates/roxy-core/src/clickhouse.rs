@@ -117,12 +117,30 @@ impl RoxyClickHouse {
             .await
             .context("Failed to create database_queries table")?;
 
+        // Migration: Add target_host column to database_queries if it doesn't exist
+        self.client
+            .query(
+                "ALTER TABLE database_queries ADD COLUMN IF NOT EXISTS target_host String DEFAULT ''",
+            )
+            .execute()
+            .await
+            .context("Failed to add target_host column to database_queries")?;
+
         // Create kafka messages table
         self.client
             .query(KAFKA_MESSAGES_TABLE_SCHEMA)
             .execute()
             .await
             .context("Failed to create kafka_messages table")?;
+
+        // Migration: Add target_host column to kafka_messages if it doesn't exist
+        self.client
+            .query(
+                "ALTER TABLE kafka_messages ADD COLUMN IF NOT EXISTS target_host String DEFAULT ''",
+            )
+            .execute()
+            .await
+            .context("Failed to add target_host column to kafka_messages")?;
 
         // Create TCP connections table for raw packet tracking
         self.client
@@ -334,12 +352,12 @@ impl RoxyClickHouse {
             r"INSERT INTO database_queries (
                 id, trace_id, span_id, parent_span_id, timestamp, duration_ms,
                 db_system, db_name, db_user, db_operation, db_statement, db_rows_affected,
-                server_address, server_port, client_address, success,
+                server_address, server_port, target_host, client_address, success,
                 error_message, error_code, application_name, attributes
             ) VALUES (
                 '{id}', '{trace_id}', '{span_id}', '{parent_span_id}', {timestamp}, {duration_ms},
                 '{db_system}', '{db_name}', '{db_user}', '{db_operation}', '{db_statement}', {db_rows_affected},
-                '{server_address}', {server_port}, '{client_address}', {success},
+                '{server_address}', {server_port}, '{target_host}', '{client_address}', {success},
                 '{error_message}', '{error_code}', '{application_name}', '{attributes}'
             )",
             id = record.id,
@@ -356,6 +374,7 @@ impl RoxyClickHouse {
             db_rows_affected = record.db_rows_affected,
             server_address = escape_string(&record.server_address),
             server_port = record.server_port,
+            target_host = escape_string(&record.target_host),
             client_address = escape_string(&record.client_address),
             success = record.success,
             error_message = escape_string(&record.error_message),
@@ -381,14 +400,14 @@ impl RoxyClickHouse {
                 messaging_system, messaging_operation, operation_type,
                 messaging_destination, messaging_consumer_group, messaging_client_id,
                 kafka_api_key, kafka_api_version, kafka_correlation_id,
-                message_count, payload_size, server_address, server_port, client_address,
+                message_count, payload_size, server_address, server_port, target_host, client_address,
                 success, error_code, error_message, attributes
             ) VALUES (
                 '{id}', '{trace_id}', '{span_id}', '{parent_span_id}', {timestamp}, {duration_ms},
                 '{messaging_system}', '{messaging_operation}', '{operation_type}',
                 '{messaging_destination}', '{messaging_consumer_group}', '{messaging_client_id}',
                 {kafka_api_key}, {kafka_api_version}, {kafka_correlation_id},
-                {message_count}, {payload_size}, '{server_address}', {server_port}, '{client_address}',
+                {message_count}, {payload_size}, '{server_address}', {server_port}, '{target_host}', '{client_address}',
                 {success}, {error_code}, '{error_message}', '{attributes}'
             )",
             id = record.id,
@@ -410,6 +429,7 @@ impl RoxyClickHouse {
             payload_size = record.payload_size,
             server_address = escape_string(&record.server_address),
             server_port = record.server_port,
+            target_host = escape_string(&record.target_host),
             client_address = escape_string(&record.client_address),
             success = record.success,
             error_code = record.error_code,
@@ -428,9 +448,16 @@ impl RoxyClickHouse {
 
     /// Query recent database queries
     pub async fn get_recent_database_queries(&self, limit: u32) -> Result<Vec<DatabaseQueryRow>> {
+        // Explicit column list to handle schema migrations (target_host added later)
         let queries = self
             .client
-            .query("SELECT * FROM database_queries ORDER BY timestamp DESC LIMIT ?")
+            .query(
+                "SELECT id, trace_id, span_id, parent_span_id, timestamp, duration_ms, \
+                 db_system, db_name, db_user, db_operation, db_statement, db_rows_affected, \
+                 server_address, server_port, target_host, client_address, success, \
+                 error_message, error_code, application_name, attributes \
+                 FROM database_queries ORDER BY timestamp DESC LIMIT ?",
+            )
             .bind(limit)
             .fetch_all::<DatabaseQueryRow>()
             .await?;
@@ -439,9 +466,17 @@ impl RoxyClickHouse {
 
     /// Query recent Kafka messages
     pub async fn get_recent_kafka_messages(&self, limit: u32) -> Result<Vec<KafkaMessageRow>> {
+        // Explicit column list to handle schema migrations (target_host added later)
         let messages = self
             .client
-            .query("SELECT * FROM kafka_messages ORDER BY timestamp DESC LIMIT ?")
+            .query(
+                "SELECT id, trace_id, span_id, parent_span_id, timestamp, duration_ms, \
+                 messaging_system, messaging_operation, operation_type, messaging_destination, \
+                 messaging_consumer_group, messaging_client_id, kafka_api_key, kafka_api_version, \
+                 kafka_correlation_id, message_count, payload_size, server_address, server_port, \
+                 target_host, client_address, success, error_code, error_message, attributes \
+                 FROM kafka_messages ORDER BY timestamp DESC LIMIT ?",
+            )
             .bind(limit)
             .fetch_all::<KafkaMessageRow>()
             .await?;
@@ -454,9 +489,16 @@ impl RoxyClickHouse {
         db_system: &str,
         limit: u32,
     ) -> Result<Vec<DatabaseQueryRow>> {
+        // Explicit column list to handle schema migrations (target_host added later)
         let queries = self
             .client
-            .query("SELECT * FROM database_queries WHERE db_system = ? ORDER BY timestamp DESC LIMIT ?")
+            .query(
+                "SELECT id, trace_id, span_id, parent_span_id, timestamp, duration_ms, \
+                 db_system, db_name, db_user, db_operation, db_statement, db_rows_affected, \
+                 server_address, server_port, target_host, client_address, success, \
+                 error_message, error_code, application_name, attributes \
+                 FROM database_queries WHERE db_system = ? ORDER BY timestamp DESC LIMIT ?",
+            )
             .bind(db_system)
             .bind(limit)
             .fetch_all::<DatabaseQueryRow>()
@@ -470,9 +512,17 @@ impl RoxyClickHouse {
         topic: &str,
         limit: u32,
     ) -> Result<Vec<KafkaMessageRow>> {
+        // Explicit column list to handle schema migrations (target_host added later)
         let messages = self
             .client
-            .query("SELECT * FROM kafka_messages WHERE messaging_destination LIKE ? ORDER BY timestamp DESC LIMIT ?")
+            .query(
+                "SELECT id, trace_id, span_id, parent_span_id, timestamp, duration_ms, \
+                 messaging_system, messaging_operation, operation_type, messaging_destination, \
+                 messaging_consumer_group, messaging_client_id, kafka_api_key, kafka_api_version, \
+                 kafka_correlation_id, message_count, payload_size, server_address, server_port, \
+                 target_host, client_address, success, error_code, error_message, attributes \
+                 FROM kafka_messages WHERE messaging_destination LIKE ? ORDER BY timestamp DESC LIMIT ?",
+            )
             .bind(format!("%{}%", topic))
             .bind(limit)
             .fetch_all::<KafkaMessageRow>()
@@ -737,6 +787,8 @@ pub struct DatabaseQueryRow {
     pub db_rows_affected: i64,
     pub server_address: String,
     pub server_port: u16,
+    /// Original target hostname (e.g., postgres.database.svc.cluster.local)
+    pub target_host: String,
     pub client_address: String,
     pub success: u8,
     pub error_message: String,
@@ -767,6 +819,8 @@ pub struct KafkaMessageRow {
     pub payload_size: i64,
     pub server_address: String,
     pub server_port: u16,
+    /// Original target hostname (e.g., kafka.messaging.svc.cluster.local)
+    pub target_host: String,
     pub client_address: String,
     pub success: u8,
     pub error_code: i16,
@@ -1007,6 +1061,7 @@ CREATE TABLE IF NOT EXISTS database_queries (
     db_rows_affected Int64,
     server_address String,
     server_port UInt16,
+    target_host String,
     client_address String,
     success UInt8,
     error_message String,
@@ -1044,6 +1099,7 @@ CREATE TABLE IF NOT EXISTS kafka_messages (
     payload_size Int64,
     server_address String,
     server_port UInt16,
+    target_host String,
     client_address String,
     success UInt8,
     error_code Int16,

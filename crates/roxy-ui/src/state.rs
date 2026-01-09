@@ -249,6 +249,9 @@ pub struct AppState {
     /// Currently selected broker filter for messaging view
     pub selected_broker: Option<String>,
 
+    /// Currently selected database host filter for database view
+    pub selected_db_host: Option<String>,
+
     /// Currently selected request for detail view
     pub selected_request: Option<HttpRequestRecord>,
 
@@ -409,6 +412,7 @@ impl AppState {
             requests: Vec::new(),
             selected_host: None,
             selected_broker: None,
+            selected_db_host: None,
             selected_request: None,
             active_detail_tab: DetailTab::default(),
             error_message: None,
@@ -606,6 +610,7 @@ impl AppState {
         self.selected_request = None;
         self.selected_host = None;
         self.selected_broker = None;
+        self.selected_db_host = None;
     }
 
     /// Select a request for detail view
@@ -645,12 +650,81 @@ impl AppState {
             .filter(|m| {
                 match &self.selected_broker {
                     Some(broker) => {
-                        // Match against server_address:server_port
-                        let msg_broker = format!("{}:{}", m.server_address, m.server_port);
-                        &msg_broker == broker || &m.server_address == broker
+                        // Match against target_host:port (FQDN) or server_address:port
+                        let msg_broker = if !m.target_host.is_empty() {
+                            format!("{}:{}", m.target_host, m.server_port)
+                        } else {
+                            format!("{}:{}", m.server_address, m.server_port)
+                        };
+                        &msg_broker == broker || &m.target_host == broker
                     }
                     None => true,
                 }
+            })
+            .collect()
+    }
+
+    /// Select a database host filter for database view
+    pub fn select_db_host(&mut self, host: String) {
+        self.selected_db_host = Some(host);
+    }
+
+    /// Clear the database host filter
+    pub fn clear_db_host_filter(&mut self) {
+        self.selected_db_host = None;
+    }
+
+    /// Get filtered database queries based on selected database host
+    pub fn filtered_database_queries(&self) -> Vec<&DatabaseQueryRow> {
+        self.database_queries
+            .iter()
+            .filter(|q| {
+                match &self.selected_db_host {
+                    Some(host) => {
+                        // Match against target_host:port (FQDN) or server_address:port
+                        let query_host = if !q.target_host.is_empty() {
+                            format!("{}:{}", q.target_host, q.server_port)
+                        } else {
+                            format!("{}:{}", q.server_address, q.server_port)
+                        };
+                        &query_host == host || &q.target_host == host
+                    }
+                    None => true,
+                }
+            })
+            .collect()
+    }
+
+    /// Get unique database hosts from queries
+    pub fn database_hosts(&self) -> Vec<HostSummary> {
+        use std::collections::HashMap;
+
+        let mut host_stats: HashMap<String, (u64, f64, i64)> = HashMap::new();
+
+        for query in &self.database_queries {
+            // Use target_host (FQDN) if available, otherwise fall back to server_address
+            let host = if !query.target_host.is_empty() {
+                format!("{}:{}", query.target_host, query.server_port)
+            } else {
+                format!("{}:{}", query.server_address, query.server_port)
+            };
+            let entry = host_stats.entry(host).or_insert((0, 0.0, 0));
+            entry.0 += 1; // request count
+            entry.1 += query.duration_ms; // total duration for avg
+            entry.2 = entry.2.max(query.timestamp); // last seen
+        }
+
+        host_stats
+            .into_iter()
+            .map(|(host, (count, total_duration, last_seen))| HostSummary {
+                host,
+                request_count: count,
+                avg_duration_ms: if count > 0 {
+                    total_duration / count as f64
+                } else {
+                    0.0
+                },
+                last_seen,
             })
             .collect()
     }
@@ -662,7 +736,12 @@ impl AppState {
         let mut broker_stats: HashMap<String, (u64, f64, i64)> = HashMap::new();
 
         for msg in &self.kafka_messages {
-            let broker = format!("{}:{}", msg.server_address, msg.server_port);
+            // Use target_host (FQDN) if available, otherwise fall back to server_address
+            let broker = if !msg.target_host.is_empty() {
+                format!("{}:{}", msg.target_host, msg.server_port)
+            } else {
+                format!("{}:{}", msg.server_address, msg.server_port)
+            };
             let entry = broker_stats.entry(broker).or_insert((0, 0.0, 0));
             entry.0 += 1; // request count
             entry.1 += msg.duration_ms; // total duration for avg
