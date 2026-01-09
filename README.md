@@ -561,6 +561,34 @@ All Roxy data is stored in `~/.roxy/`:
 | `ROXY_CONFIGURE_SYSTEM_PROXY` | Auto-configure macOS system proxy | `false` |
 | `RUST_LOG` | Logging level | `info,roxy_proxy=debug` |
 
+### MCP Server (AI Agent Integration)
+
+Roxy includes an MCP (Model Context Protocol) server that exposes observability data to AI agents. The server runs automatically on port 3001 when roxy-proxy starts.
+
+**SSE Endpoint:** `http://localhost:3001/sse`
+
+Available tools for AI agents:
+- `get_recent_http_requests` - Query recent HTTP requests with filtering
+- `get_trace_spans` - Get spans for a specific trace ID
+- `get_recent_spans` - Get recent OpenTelemetry spans
+- `get_request_by_id` - Get full details of a specific request
+- `get_recent_database_queries` - Query PostgreSQL/MySQL queries
+- `get_recent_kafka_messages` - Query Kafka operations
+- `get_host_summary` - Get aggregated host statistics
+- `search_http_requests` - Full-text search across requests
+
+For Claude Desktop (stdio transport), use the standalone binary:
+
+```json
+{
+  "mcpServers": {
+    "roxy": {
+      "command": "/path/to/roxy-mcp"
+    }
+  }
+}
+```
+
 ### Running Proxy Standalone
 
 If you want to run just the proxy (e.g., on Linux without the UI):
@@ -599,6 +627,11 @@ roxy/
     │           ├── downloader.rs   # Binary download manager
     │           ├── clickhouse.rs   # ClickHouse subprocess
     │           └── otel_collector.rs
+    ├── roxy-mcp/               # MCP server for AI agents
+    │   └── src/
+    │       ├── lib.rs          # Library with SSE support
+    │       ├── main.rs         # Standalone stdio binary
+    │       └── tools.rs        # MCP tool definitions
     ├── roxy-proxy/             # Proxy worker binary
     │   └── src/
     │       └── main.rs
@@ -709,6 +742,8 @@ For code signing and notarization (required for distribution), set these environ
 - [x] Auto-download service binaries
 - [x] Platform detection (macOS, Linux)
 - [x] Update checking from GitHub releases
+- [x] MCP server for AI agent integration (query spans, HTTP requests, database queries)
+- [ ] MCP server routing configuration tools
 - [ ] Kubernetes watch API for real-time resource updates (replace polling)
 - [ ] Automatic update installation
 - [ ] Crash reporting (opt-in)

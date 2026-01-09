@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 # Internal
 roxy-core.workspace = true
+roxy-mcp = { path = "../roxy-mcp", features = ["sse"] }
 
 # Async runtime
 tokio.workspace = true
