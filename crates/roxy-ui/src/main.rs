@@ -427,6 +427,10 @@ impl RoxyApp {
                             // In messaging mode, filter by broker
                             app.state.select_broker(host);
                         }
+                        ViewMode::Database => {
+                            // In database mode, filter by database host
+                            app.state.select_db_host(host);
+                        }
                         _ => {
                             // In other modes, filter by host and switch to Requests
                             app.state.select_host(host.clone());
@@ -446,6 +450,9 @@ impl RoxyApp {
                     match app.state.view_mode {
                         ViewMode::Messaging => {
                             app.state.clear_broker_filter();
+                        }
+                        ViewMode::Database => {
+                            app.state.clear_db_host_filter();
                         }
                         _ => {
                             app.state.clear_host_filter();
@@ -521,7 +528,7 @@ impl RoxyApp {
             })
         };
 
-        // Combine HTTP hosts with Kafka brokers for the hosts list
+        // Combine HTTP hosts with Kafka brokers and database hosts for the hosts list
         let mut all_hosts = self.state.hosts.clone();
         let kafka_brokers = self.state.kafka_brokers();
         for broker in kafka_brokers {
@@ -530,10 +537,20 @@ impl RoxyApp {
                 all_hosts.push(broker);
             }
         }
+        let db_hosts = self.state.database_hosts();
+        for db_host in db_hosts {
+            // Only add if not already present
+            if !all_hosts.iter().any(|h| h.host == db_host.host) {
+                all_hosts.push(db_host);
+            }
+        }
+        // Sort alphabetically to prevent list from jumping around
+        all_hosts.sort_by(|a, b| a.host.cmp(&b.host));
 
         // Selected host depends on view mode
         let selected_host = match self.state.view_mode {
             ViewMode::Messaging => self.state.selected_broker.clone(),
+            ViewMode::Database => self.state.selected_db_host.clone(),
             _ => self.state.selected_host.clone(),
         };
 
@@ -926,8 +943,19 @@ impl RoxyApp {
             });
         });
 
+        // Use filtered queries when a db host is selected
+        let queries: Vec<roxy_core::DatabaseQueryRow> = if self.state.selected_db_host.is_some() {
+            self.state
+                .filtered_database_queries()
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            self.state.database_queries.clone()
+        };
+
         database_list(DatabaseListProps {
-            queries: self.state.database_queries.clone(),
+            queries,
             selected_query_id: self
                 .state
                 .selected_database_query

@@ -767,6 +767,7 @@ async fn parse_postgres_data(
                     client_addr,
                     target_addr,
                     target_port,
+                    &stats.target_host,
                     clickhouse,
                 )
                 .await;
@@ -793,6 +794,7 @@ async fn handle_postgres_message(
     client_addr: &SocketAddr,
     target_addr: &SocketAddr,
     target_port: u16,
+    target_host: &str,
     clickhouse: &Option<Arc<RoxyClickHouse>>,
 ) {
     match msg {
@@ -889,6 +891,7 @@ async fn handle_postgres_message(
                         db_rows_affected: rows_affected.unwrap_or(-1),
                         server_address: target_addr.ip().to_string(),
                         server_port: target_port,
+                        target_host: target_host.to_string(),
                         client_address: client_addr.to_string(),
                         success: 1,
                         error_message: String::new(),
@@ -933,6 +936,7 @@ async fn handle_postgres_message(
                         db_rows_affected: -1,
                         server_address: target_addr.ip().to_string(),
                         server_port: target_port,
+                        target_host: target_host.to_string(),
                         client_address: client_addr.to_string(),
                         success: 0,
                         error_message: error.message,
@@ -1089,6 +1093,7 @@ async fn parse_kafka_data(
                             payload_size: 0,
                             server_address: target_addr.ip().to_string(),
                             server_port: target_port,
+                            target_host: stats.target_host.clone(),
                             client_address: client_addr.to_string(),
                             success: 1,
                             error_code: 0,

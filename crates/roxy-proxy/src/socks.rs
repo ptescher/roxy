@@ -551,7 +551,8 @@ async fn handle_client(
             stream.flush().await?;
 
             // Start bidirectional copy with protocol interception using generic version
-            let target_host = format!("{}:{}", target_addr, target_port);
+            // target_host should be just the hostname without port
+            let target_host = target_addr.to_string();
             let intercept_stats = run_intercepting_tunnel_generic(
                 stream,
                 target_stream,
@@ -613,7 +614,8 @@ async fn handle_client(
                     send_reply(&mut stream, Reply::Succeeded, Some(addr)).await?;
 
                     // Step 6: Start bidirectional copy with protocol interception
-                    let target_host = format!("{}:{}", target_addr, target_port);
+                    // target_host should be just the hostname without port
+                    let target_host = target_addr.to_string();
                     let intercept_stats = run_intercepting_tunnel(
                         stream,
                         target_stream,

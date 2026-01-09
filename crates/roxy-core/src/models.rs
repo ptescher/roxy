@@ -336,6 +336,9 @@ pub struct DatabaseQueryRecord {
     /// Server port
     pub server_port: u16,
 
+    /// Original target hostname (e.g., postgres.database.svc.cluster.local)
+    pub target_host: String,
+
     /// Client address
     pub client_address: String,
 
@@ -362,6 +365,7 @@ impl DatabaseQueryRecord {
         db_statement: String,
         server_address: String,
         server_port: u16,
+        target_host: String,
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -378,6 +382,7 @@ impl DatabaseQueryRecord {
             db_rows_affected: None,
             server_address,
             server_port,
+            target_host,
             client_address: String::new(),
             success: true,
             error_message: None,
@@ -499,6 +504,9 @@ pub struct KafkaMessageRecord {
     /// Server port
     pub server_port: u16,
 
+    /// Original target hostname (e.g., kafka.messaging.svc.cluster.local)
+    pub target_host: String,
+
     /// Client address
     pub client_address: String,
 
@@ -525,6 +533,7 @@ impl KafkaMessageRecord {
         correlation_id: i32,
         server_address: String,
         server_port: u16,
+        target_host: String,
     ) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -546,6 +555,7 @@ impl KafkaMessageRecord {
             payload_size: None,
             server_address,
             server_port,
+            target_host,
             client_address: String::new(),
             success: true,
             error_code: None,
