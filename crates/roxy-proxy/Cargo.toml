@@ -29,6 +29,15 @@ hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 
+# TLS
+rustls.workspace = true
+rcgen.workspace = true
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+time = "0.3"
+dirs.workspace = true
+base64.workspace = true
+
 # OpenTelemetry
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
@@ -75,3 +84,6 @@ futures = { workspace = true }
 
 # SOCKS proxy client for integration tests
 tokio-socks = "0.5"
+
+# TLS testing
+tempfile = "3"

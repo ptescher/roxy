@@ -708,6 +708,9 @@ For code signing and notarization (required for distribution), set these environ
 - [x] Kubernetes service discovery
 - [x] PostgreSQL protocol parsing and query capture
 - [x] Kafka protocol parsing and message capture
+- [x] TLS interception with CA generation
+- [x] On-demand certificate generation for intercepted hosts
+- [x] Configurable host list for TLS interception
 - [ ] OpenAPI schema awareness
 - [ ] Request/response modification
 - [ ] Breakpoints and debugging
