@@ -2,21 +2,47 @@
 //!
 //! This library provides a simple forwarding proxy that:
 //! - Forwards HTTP requests and logs them to ClickHouse
-//! - Tunnels HTTPS (CONNECT) requests transparently without TLS interception
+//! - Supports TLS interception for configured hosts (with CA certificate generation)
+//! - Tunnels HTTPS (CONNECT) requests transparently for non-intercepted hosts
 //! - Provides a SOCKS5 proxy for TCP connections (PostgreSQL, Kafka, etc.)
 //!
-//! This approach avoids certificate issues with iOS/mobile apps.
+//! ## TLS Interception
+//!
+//! By default, HTTPS connections are tunneled through without interception.
+//! To enable TLS interception:
+//!
+//! 1. Enable TLS in the proxy configuration
+//! 2. Add hosts to the interception list
+//! 3. Trust the generated CA certificate on your clients
+//!
+//! The CA certificate is generated on first run and stored in `~/.roxy/ca.crt`.
+
+use std::sync::Once;
+
+static CRYPTO_INIT: Once = Once::new();
+
+/// Initialize the TLS crypto provider (ring).
+///
+/// This must be called before any TLS operations. It's safe to call multiple
+/// times - only the first call will have any effect.
+pub fn init_crypto_provider() {
+    CRYPTO_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 pub mod gateway;
 pub mod kubectl;
 pub mod process;
 pub mod protocol;
 pub mod socks;
+pub mod tls;
 
 pub use gateway::GatewayRouter;
 pub use kubectl::{K8sService, K8sStream, KubectlPortForwardManager};
 pub use process::{identify_process, ProcessInfo};
 pub use socks::{SocksConfig, SocksProxy, DEFAULT_SOCKS_PORT};
+pub use tls::{CertificateAuthority, TlsConfig, TlsInterceptionMode, TlsManager};
 
 // Re-export MCP types
 pub use roxy_mcp::{SseMcpServer, SseServerConfig as McpConfig, DEFAULT_MCP_SSE_PORT};
@@ -182,6 +208,8 @@ pub struct ProxyConfig {
     pub enable_mcp: bool,
     /// MCP server configuration
     pub mcp: McpConfig,
+    /// TLS interception configuration
+    pub tls: TlsConfig,
 }
 
 impl Default for ProxyConfig {
@@ -195,6 +223,7 @@ impl Default for ProxyConfig {
             socks: SocksConfig::default(),
             enable_mcp: true,
             mcp: McpConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -211,6 +240,8 @@ struct ProxyState {
     gateway_router: tokio::sync::Mutex<GatewayRouter>,
     /// Shared state for tracking active K8s connections (for UI display)
     active_k8s_connections: Arc<ActiveK8sConnections>,
+    /// TLS manager for certificate generation and interception
+    tls_manager: Option<Arc<TlsManager>>,
 }
 
 /// HTTP body type alias
@@ -247,68 +278,127 @@ async fn handle_request(
 }
 
 /// Handle HTTP CONNECT requests by establishing a tunnel
+///
+/// If TLS interception is enabled for the target host, we perform TLS
+/// termination and re-encryption. Otherwise, we tunnel raw bytes through.
 async fn handle_connect(
     req: Request<hyper::body::Incoming>,
     client_addr: SocketAddr,
     state: Arc<ProxyState>,
 ) -> Result<Response<BoxBody>, hyper::Error> {
-    let host = req.uri().authority().map(|a| a.to_string());
+    let authority = req.uri().authority().map(|a| a.to_string());
 
-    if let Some(addr) = host {
+    if let Some(addr) = authority {
+        // Extract host (without port) for interception check
+        let host = addr.split(':').next().unwrap_or(&addr).to_string();
+        let target_port = addr
+            .split(':')
+            .nth(1)
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(443);
+
+        // Check if we should intercept TLS for this host
+        let should_intercept = if let Some(ref tls_manager) = state.tls_manager {
+            tls_manager.should_intercept(&host).await
+        } else {
+            false
+        };
+
         state.tunnel_count.fetch_add(1, Ordering::Relaxed);
 
-        debug!(
-            client = %client_addr,
-            target = %addr,
-            "Establishing HTTPS tunnel"
-        );
+        if should_intercept {
+            debug!(
+                client = %client_addr,
+                target = %addr,
+                "Intercepting TLS connection"
+            );
 
-        // Spawn a task to handle the tunnel
-        tokio::task::spawn(async move {
-            match hyper::upgrade::on(req).await {
-                Ok(upgraded) => {
-                    // Connect to the target server
-                    match TcpStream::connect(&addr).await {
-                        Ok(mut target_stream) => {
-                            let mut upgraded = TokioIo::new(upgraded);
+            // Get TLS manager for interception
+            let tls_manager = state.tls_manager.clone().unwrap();
+            let clickhouse = state.clickhouse.clone();
 
-                            // Bidirectional copy
-                            let (mut client_reader, mut client_writer) =
-                                tokio::io::split(&mut upgraded);
-                            let (mut target_reader, mut target_writer) =
-                                tokio::io::split(&mut target_stream);
-
-                            let client_to_target =
-                                tokio::io::copy(&mut client_reader, &mut target_writer);
-                            let target_to_client =
-                                tokio::io::copy(&mut target_reader, &mut client_writer);
-
-                            match tokio::try_join!(client_to_target, target_to_client) {
-                                Ok((to_target, to_client)) => {
-                                    debug!(
-                                        target = %addr,
-                                        bytes_to_target = to_target,
-                                        bytes_to_client = to_client,
-                                        "Tunnel closed"
-                                    );
-                                }
-                                Err(e) => {
-                                    debug!(target = %addr, error = %e, "Tunnel error");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(target = %addr, error = %e, "Failed to connect to target");
+            // Spawn a task to handle the intercepted connection
+            tokio::task::spawn(async move {
+                match hyper::upgrade::on(req).await {
+                    Ok(upgraded) => {
+                        if let Err(e) = handle_tls_intercept(
+                            upgraded,
+                            &host,
+                            target_port,
+                            client_addr,
+                            tls_manager,
+                            clickhouse,
+                        )
+                        .await
+                        {
+                            error!(
+                                target = %addr,
+                                error = %e,
+                                "TLS interception failed"
+                            );
                         }
                     }
+                    Err(e) => {
+                        error!(error = %e, "Upgrade failed for TLS interception");
+                    }
                 }
-                Err(e) => {
-                    error!(error = %e, "Upgrade failed");
-                }
-            }
 
-            state.tunnel_count.fetch_sub(1, Ordering::Relaxed);
-        });
+                state.tunnel_count.fetch_sub(1, Ordering::Relaxed);
+            });
+        } else {
+            debug!(
+                client = %client_addr,
+                target = %addr,
+                "Establishing HTTPS tunnel (passthrough)"
+            );
+
+            // Spawn a task to handle the transparent tunnel
+            tokio::task::spawn(async move {
+                match hyper::upgrade::on(req).await {
+                    Ok(upgraded) => {
+                        // Connect to the target server
+                        match TcpStream::connect(&addr).await {
+                            Ok(mut target_stream) => {
+                                let mut upgraded = TokioIo::new(upgraded);
+
+                                // Bidirectional copy
+                                let (mut client_reader, mut client_writer) =
+                                    tokio::io::split(&mut upgraded);
+                                let (mut target_reader, mut target_writer) =
+                                    tokio::io::split(&mut target_stream);
+
+                                let client_to_target =
+                                    tokio::io::copy(&mut client_reader, &mut target_writer);
+                                let target_to_client =
+                                    tokio::io::copy(&mut target_reader, &mut client_writer);
+
+                                match tokio::try_join!(client_to_target, target_to_client) {
+                                    Ok((to_target, to_client)) => {
+                                        debug!(
+                                            target = %addr,
+                                            bytes_to_target = to_target,
+                                            bytes_to_client = to_client,
+                                            "Tunnel closed"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        debug!(target = %addr, error = %e, "Tunnel error");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(target = %addr, error = %e, "Failed to connect to target");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Upgrade failed");
+                    }
+                }
+
+                state.tunnel_count.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
 
         // Return 200 OK to indicate tunnel established
         Ok(Response::new(empty()))
@@ -317,6 +407,194 @@ async fn handle_connect(
         *resp.status_mut() = StatusCode::BAD_REQUEST;
         Ok(resp)
     }
+}
+
+/// Handle TLS interception for a CONNECT tunnel
+///
+/// This performs:
+/// 1. TLS termination with a generated certificate for the client
+/// 2. TLS connection to the actual target server
+/// 3. HTTP request/response forwarding with logging
+async fn handle_tls_intercept(
+    upgraded: hyper::upgrade::Upgraded,
+    host: &str,
+    port: u16,
+    client_addr: SocketAddr,
+    tls_manager: Arc<TlsManager>,
+    clickhouse: RoxyClickHouse,
+) -> anyhow::Result<()> {
+    use tokio_rustls::TlsAcceptor;
+
+    // Get or generate certificate for this host
+    let server_config = tls_manager.get_certificate(host).await?;
+    let acceptor = TlsAcceptor::from(server_config);
+
+    // Accept TLS from the client - wrap in TokioIo for AsyncRead/AsyncWrite
+    let client_stream = TokioIo::new(upgraded);
+    let tls_stream = acceptor.accept(client_stream).await?;
+
+    debug!(host = %host, "TLS handshake complete with client");
+
+    // Connect to the actual target server with TLS
+    let target_addr = format!("{}:{}", host, port);
+    let target_stream = TcpStream::connect(&target_addr).await?;
+
+    // Create TLS connector for the target
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
+    let target_tls = connector.connect(server_name, target_stream).await?;
+
+    debug!(host = %host, "TLS handshake complete with target server");
+
+    // Now we have decrypted streams on both sides - run HTTP proxy between them
+    run_https_proxy(tls_stream, target_tls, host, client_addr, clickhouse).await
+}
+
+/// Run HTTP proxy between decrypted TLS streams
+async fn run_https_proxy<C, S>(
+    client_stream: C,
+    server_stream: S,
+    host: &str,
+    client_addr: SocketAddr,
+    clickhouse: RoxyClickHouse,
+) -> anyhow::Result<()>
+where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (client_read, mut client_write) = tokio::io::split(client_stream);
+    let (server_read, mut server_write) = tokio::io::split(server_stream);
+
+    let mut client_reader = BufReader::new(client_read);
+    let mut server_reader = BufReader::new(server_read);
+
+    let host = host.to_string();
+
+    // Simple bidirectional proxy with basic HTTP request/response logging
+    // For a full implementation, we would parse HTTP and log like handle_http_forward
+    loop {
+        let mut request_line = String::new();
+
+        // Read request from client
+        match client_reader.read_line(&mut request_line).await {
+            Ok(0) => {
+                debug!(host = %host, "Client closed connection");
+                break;
+            }
+            Ok(_) => {
+                // Parse basic request info
+                let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+                let (method, path) = if parts.len() >= 2 {
+                    (parts[0], parts[1])
+                } else {
+                    ("UNKNOWN", "/")
+                };
+
+                debug!(
+                    host = %host,
+                    method = %method,
+                    path = %path,
+                    "Intercepted HTTPS request"
+                );
+
+                // Forward request line to server
+                server_write.write_all(request_line.as_bytes()).await?;
+
+                // Read and forward headers
+                loop {
+                    let mut header_line = String::new();
+                    client_reader.read_line(&mut header_line).await?;
+                    server_write.write_all(header_line.as_bytes()).await?;
+
+                    if header_line.trim().is_empty() {
+                        break;
+                    }
+                }
+                server_write.flush().await?;
+
+                // Read response from server and forward to client
+                let mut response_line = String::new();
+                server_reader.read_line(&mut response_line).await?;
+                client_write.write_all(response_line.as_bytes()).await?;
+
+                // Parse response status
+                let status: u16 = response_line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                debug!(
+                    host = %host,
+                    method = %method,
+                    path = %path,
+                    status = %status,
+                    "Intercepted HTTPS response"
+                );
+
+                // Log to ClickHouse (simplified - full implementation would capture body)
+                let record = HttpRequestRecord {
+                    id: Uuid::new_v4().to_string(),
+                    trace_id: format!("{:032x}", rand::random::<u128>()),
+                    span_id: format!("{:016x}", rand::random::<u64>()),
+                    timestamp: Utc::now().timestamp_millis(),
+                    method: method.to_string(),
+                    url: format!("https://{}{}", host, path),
+                    host: host.clone(),
+                    path: path.to_string(),
+                    query: String::new(),
+                    request_headers: "{}".to_string(),
+                    request_body: String::new(),
+                    request_body_size: 0,
+                    response_status: status,
+                    response_headers: "{}".to_string(),
+                    response_body: String::new(),
+                    response_body_size: 0,
+                    duration_ms: 0.0,
+                    error: String::new(),
+                    client_ip: client_addr.ip().to_string(),
+                    server_ip: host.clone(),
+                    protocol: "HTTP/1.1".to_string(),
+                    tls_version: "TLS 1.3".to_string(),
+                    client_name: String::new(),
+                };
+
+                let ch = clickhouse.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = ch.insert_http_request(&record).await {
+                        tracing::warn!(error = %e, "Failed to log intercepted request");
+                    }
+                });
+
+                // Forward response headers
+                loop {
+                    let mut header_line = String::new();
+                    server_reader.read_line(&mut header_line).await?;
+                    client_write.write_all(header_line.as_bytes()).await?;
+
+                    if header_line.trim().is_empty() {
+                        break;
+                    }
+                }
+                client_write.flush().await?;
+            }
+            Err(e) => {
+                debug!(host = %host, error = %e, "Error reading from client");
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle regular HTTP forward proxy requests
@@ -849,6 +1127,8 @@ pub struct ProxyServer {
     active_k8s_connections: Arc<ActiveK8sConnections>,
     /// Optional MCP server for AI agent integration
     mcp_server: Option<SseMcpServer>,
+    /// TLS manager for certificate generation (if TLS interception enabled)
+    tls_manager: Option<Arc<TlsManager>>,
 }
 
 impl ProxyServer {
@@ -864,6 +1144,28 @@ impl ProxyServer {
     ) -> Result<Self> {
         let clickhouse = RoxyClickHouse::new(config.clickhouse.clone());
 
+        // Initialize TLS crypto provider
+        init_crypto_provider();
+
+        // Initialize TLS manager if TLS interception is enabled
+        let tls_manager = if config.tls.enabled {
+            match TlsManager::new(config.tls.clone()).await {
+                Ok(manager) => {
+                    info!(
+                        ca_cert = %manager.ca_cert_path().await,
+                        "TLS interception enabled"
+                    );
+                    Some(Arc::new(manager))
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to initialize TLS manager, interception disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let state = Arc::new(ProxyState {
             clickhouse,
             request_count: AtomicU64::new(0),
@@ -871,6 +1173,7 @@ impl ProxyServer {
             kubectl_manager: tokio::sync::Mutex::new(KubectlPortForwardManager::new()),
             gateway_router: tokio::sync::Mutex::new(GatewayRouter::new()),
             active_k8s_connections: active_k8s_connections.clone(),
+            tls_manager,
         });
 
         // Create SOCKS5 proxy if enabled, with ClickHouse for protocol interception
@@ -886,6 +1189,9 @@ impl ProxyServer {
             None
         };
 
+        // Clone tls_manager from state for the ProxyServer struct
+        let tls_manager = state.tls_manager.clone();
+
         Ok(Self {
             config,
             service_manager: ServiceManager::new(),
@@ -894,6 +1200,7 @@ impl ProxyServer {
             socks_proxy,
             active_k8s_connections,
             mcp_server: None,
+            tls_manager,
         })
     }
 
@@ -995,7 +1302,16 @@ impl ProxyServer {
         }
         info!("  ClickHouse: http://127.0.0.1:8123");
         info!("  OTel:       http://127.0.0.1:4317 (gRPC)");
-        info!("  Mode:       Forwarding (no TLS interception)");
+        if let Some(tls) = &self.tls_manager {
+            info!("  TLS:        Interception enabled (for configured hosts)");
+            info!("  CA Cert:    {}", tls.ca_cert_path().await);
+            let hosts = tls.intercept_hosts().await;
+            if !hosts.is_empty() {
+                info!("  Intercept:  {} host(s) configured", hosts.len());
+            }
+        } else {
+            info!("  TLS:        Passthrough (no interception)");
+        }
         info!("=================================================");
 
         loop {
@@ -1082,6 +1398,65 @@ impl ProxyServer {
         if let Some(socks) = &self.socks_proxy {
             socks.remove_port_forward(dns_name).await;
         }
+    }
+
+    /// Get the TLS manager (if TLS interception is enabled)
+    pub fn tls_manager(&self) -> Option<&Arc<TlsManager>> {
+        self.tls_manager.as_ref()
+    }
+
+    /// Add a host to the TLS interception list
+    ///
+    /// Traffic to this host will be decrypted, inspected, and re-encrypted.
+    /// The client must trust the Roxy CA certificate.
+    pub async fn add_tls_intercept_host(&self, host: String) {
+        if let Some(tls) = &self.tls_manager {
+            tls.add_intercept_host(host.clone()).await;
+            info!(host = %host, "Added host to TLS interception list");
+        } else {
+            warn!("Cannot add TLS intercept host: TLS interception is not enabled");
+        }
+    }
+
+    /// Remove a host from the TLS interception list
+    ///
+    /// Traffic to this host will be tunneled through without interception.
+    pub async fn remove_tls_intercept_host(&self, host: &str) {
+        if let Some(tls) = &self.tls_manager {
+            tls.remove_intercept_host(host).await;
+            info!(host = %host, "Removed host from TLS interception list");
+        }
+    }
+
+    /// Get the list of hosts configured for TLS interception
+    pub async fn tls_intercept_hosts(&self) -> Vec<String> {
+        if let Some(tls) = &self.tls_manager {
+            tls.intercept_hosts().await
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get the CA certificate in PEM format
+    ///
+    /// This certificate should be installed in client trust stores
+    /// to enable TLS interception without certificate warnings.
+    pub fn ca_cert_pem(&self) -> Option<&str> {
+        self.tls_manager.as_ref().map(|tls| tls.ca_cert_pem())
+    }
+
+    /// Get the path to the CA certificate file
+    pub async fn ca_cert_path(&self) -> Option<String> {
+        if let Some(tls) = &self.tls_manager {
+            Some(tls.ca_cert_path().await)
+        } else {
+            None
+        }
+    }
+
+    /// Check if TLS interception is enabled
+    pub fn tls_interception_enabled(&self) -> bool {
+        self.tls_manager.is_some()
     }
 
     /// Stop backend services
