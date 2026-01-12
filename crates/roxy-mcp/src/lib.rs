@@ -9,8 +9,10 @@
 //! - `sse` - Enable SSE transport for remote/embedded usage
 
 mod tools;
+mod datadog;
 
 pub use tools::RoxyMcpServer;
+pub use datadog::DatadogClient;
 
 use anyhow::Result;
 use rmcp::ServiceExt;

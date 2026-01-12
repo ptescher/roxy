@@ -452,3 +452,72 @@ impl ServerHandler for RoxyMcpServer {
         }
     }
 }
+
+// Import Datadog client
+use crate::datadog::{DatadogClient, QueryApmMetricsParams, QueryApmTracesParams, QueryLogsParams};
+
+// Extend RoxyMcpServer to optionally include Datadog client
+impl RoxyMcpServer {
+    /// Create a new MCP server instance with optional Datadog integration
+    pub async fn new_with_datadog() -> Result<Self> {
+        let config = ClickHouseConfig::default();
+        let clickhouse = RoxyClickHouse::new(config);
+
+        Ok(Self {
+            clickhouse: Arc::new(clickhouse),
+        })
+    }
+}
+
+/// Datadog integration tools (requires DD_API_KEY and DD_APP_KEY env vars)
+#[derive(Clone)]
+pub struct DatadogTools {
+    client: DatadogClient,
+}
+
+impl DatadogTools {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            client: DatadogClient::new()?,
+        })
+    }
+}
+
+#[tool(tool_box)]
+impl DatadogTools {
+    /// Query Datadog APM metrics
+    #[tool(
+        name = "datadog_query_apm_metrics",
+        description = "Query Datadog APM metrics for a service. Returns performance metrics like average duration, p95, p99."
+    )]
+    async fn query_apm_metrics(
+        &self,
+        #[tool(aggr)] params: QueryApmMetricsParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        self.client.query_apm_metrics(params).await
+    }
+
+    /// Query Datadog APM traces
+    #[tool(
+        name = "datadog_query_apm_traces",
+        description = "Query Datadog APM traces to find slow requests."
+    )]
+    async fn query_apm_traces(
+        &self,
+        #[tool(aggr)] params: QueryApmTracesParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        self.client.query_apm_traces(params).await
+    }
+
+    /// Query Datadog logs
+    #[tool(
+        name = "datadog_query_logs",
+        description = "Query Datadog logs for errors and events."
+    )]
+    async fn query_logs(
+        &self,
+        #[tool(aggr)] params: QueryLogsParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        self.client.query_logs(params).await
+    }
+}
