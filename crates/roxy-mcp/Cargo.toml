@@ -46,3 +46,7 @@ chrono = { workspace = true }
 # For SSE server
 tokio-util = "0.7"
 futures = { workspace = true }
+
+# Datadog API client
+datadog-api-client = "0.5"
+urlencoding = "2.1"
