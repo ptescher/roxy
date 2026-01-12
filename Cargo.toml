@@ -5,6 +5,7 @@ members = [
     "crates/roxy-ui",
     "crates/roxy-core",
     "crates/roxy-mcp",
+    "xtask",
 ]
 
 [workspace.package]
