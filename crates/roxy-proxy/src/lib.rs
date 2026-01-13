@@ -31,6 +31,7 @@ pub fn init_crypto_provider() {
     });
 }
 
+pub mod control;
 pub mod gateway;
 pub mod kubectl;
 pub mod process;
@@ -242,6 +243,8 @@ struct ProxyState {
     active_k8s_connections: Arc<ActiveK8sConnections>,
     /// TLS manager for certificate generation and interception
     tls_manager: Option<Arc<TlsManager>>,
+    /// Whether auto port-forwarding is enabled for HTTPRoute K8s services
+    auto_port_forward_enabled: Arc<AtomicBool>,
 }
 
 /// HTTP body type alias
@@ -723,7 +726,7 @@ async fn handle_http_forward(
 
     let connect_addr = match gateway_result {
         Ok(Some((backend_dns, backend_port))) => {
-            // HTTPRoute matched - route to the backend service via port-forward
+            // HTTPRoute matched - route to the backend service via port-forward (if enabled)
             if let Some(k8s_service) = K8sService::from_dns_name(&backend_dns, backend_port) {
                 info!(
                     request_id = %request_id,
@@ -739,24 +742,34 @@ async fn handle_http_forward(
                     .add_connection(&k8s_service)
                     .await;
 
-                let mut manager = state.kubectl_manager.lock().await;
-                match manager.get_or_create_forward(k8s_service).await {
-                    Ok(local_addr) => {
-                        info!(
-                            request_id = %request_id,
-                            local_addr = %local_addr,
-                            "K8s port-forward ready via HTTPRoute"
-                        );
-                        local_addr.to_string()
+                // Check if auto port-forward is enabled
+                if state.auto_port_forward_enabled.load(Ordering::Relaxed) {
+                    let mut manager = state.kubectl_manager.lock().await;
+                    match manager.get_or_create_forward(k8s_service).await {
+                        Ok(local_addr) => {
+                            info!(
+                                request_id = %request_id,
+                                local_addr = %local_addr,
+                                "K8s port-forward ready via HTTPRoute (auto port-forward enabled)"
+                            );
+                            local_addr.to_string()
+                        }
+                        Err(e) => {
+                            error!(
+                                request_id = %request_id,
+                                error = %e,
+                                "Failed to create K8s port-forward for HTTPRoute backend"
+                            );
+                            target_addr.clone()
+                        }
                     }
-                    Err(e) => {
-                        error!(
-                            request_id = %request_id,
-                            error = %e,
-                            "Failed to create K8s port-forward for HTTPRoute backend"
-                        );
-                        target_addr.clone()
-                    }
+                } else {
+                    info!(
+                        request_id = %request_id,
+                        "Auto port-forward disabled, attempting direct connection to {}",
+                        backend_dns
+                    );
+                    format!("{}:{}", backend_dns, backend_port)
                 }
             } else {
                 // Backend is not a K8s service DNS, try direct connection
@@ -927,6 +940,28 @@ async fn handle_http_forward(
                         }
                     });
 
+                    // Check if this is a Datadog RUM event and store it
+                    let path_for_rum_check = parts.uri.path().to_string();
+                    if is_datadog_rum_request(&host, &path_for_rum_check) {
+                        let clickhouse = state.clickhouse.clone();
+                        let req_body_bytes = body_bytes.clone();
+                        let resp_body_bytes_clone = resp_body_bytes.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = parse_and_store_datadog_rum_events(
+                                &clickhouse,
+                                &req_body_bytes,
+                                &resp_body_bytes_clone,
+                            )
+                            .await
+                            {
+                                tracing::debug!(
+                                    error = %e,
+                                    "Failed to parse/store Datadog RUM events"
+                                );
+                            }
+                        });
+                    }
+
                     // Reconstruct response
                     let mut response = Response::builder()
                         .status(resp_parts.status)
@@ -984,6 +1019,360 @@ fn body_to_string(bytes: &Bytes) -> String {
     };
 
     String::from_utf8_lossy(slice).to_string()
+}
+
+/// Check if this is a Datadog RUM request
+fn is_datadog_rum_request(host: &str, path: &str) -> bool {
+    // Datadog RUM endpoints:
+    // - browser-intake-datadoghq.com
+    // - browser-intake-datadoghq.eu
+    // - *.browser-intake-datadoghq.com
+    // Paths typically: /api/v2/rum, /v1/input/*
+    (host.contains("browser-intake-datadoghq") || host.contains("rum.browser-intake"))
+        && (path.contains("/rum") || path.contains("/input"))
+}
+
+/// Parse and store Datadog RUM events from request/response
+async fn parse_and_store_datadog_rum_events(
+    clickhouse: &roxy_core::RoxyClickHouse,
+    request_body: &Bytes,
+    _response_body: &Bytes,
+) -> anyhow::Result<()> {
+    // Parse request body as JSON
+    let body_str = String::from_utf8_lossy(request_body);
+
+    // Datadog RUM sends events in batches, format can be:
+    // 1. Single event: {...}
+    // 2. Array of events: [...]
+    // 3. Newline-delimited JSON
+
+    let events: Vec<serde_json::Value> = if body_str.trim().starts_with('[') {
+        // Array format
+        serde_json::from_str(&body_str)?
+    } else if body_str.contains('\n') {
+        // Newline-delimited JSON
+        body_str
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    } else {
+        // Single event
+        vec![serde_json::from_str(&body_str)?]
+    };
+
+    let fetched_at = chrono::Utc::now().timestamp_millis();
+    let mut views = Vec::new();
+    let mut resources = Vec::new();
+
+    for event in events {
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match event_type {
+            "view" => {
+                if let Ok(view) = parse_rum_view_event(&event, fetched_at) {
+                    views.push(view);
+                }
+            }
+            "resource" => {
+                if let Ok(resource) = parse_rum_resource_event(&event, fetched_at) {
+                    resources.push(resource);
+                }
+            }
+            _ => {
+                // Other event types: action, error, long_task
+                tracing::debug!(event_type = event_type, "Skipping RUM event type");
+            }
+        }
+    }
+
+    if !views.is_empty() {
+        clickhouse.insert_datadog_rum_views(&views).await?;
+        tracing::info!("Stored {} intercepted Datadog RUM views", views.len());
+    }
+
+    if !resources.is_empty() {
+        clickhouse.insert_datadog_rum_resources(&resources).await?;
+        tracing::info!(
+            "Stored {} intercepted Datadog RUM resources",
+            resources.len()
+        );
+    }
+
+    Ok(())
+}
+
+/// Parse a RUM view event
+fn parse_rum_view_event(
+    event: &serde_json::Value,
+    fetched_at: i64,
+) -> anyhow::Result<roxy_core::clickhouse::DatadogRumViewRecord> {
+    use roxy_core::clickhouse::DatadogRumViewRecord;
+
+    let view = event
+        .get("view")
+        .ok_or_else(|| anyhow::anyhow!("Missing view field"))?;
+    let session = event.get("session");
+    let application = event.get("application");
+
+    Ok(DatadogRumViewRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        view_id: view
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        session_id: session
+            .and_then(|s| s.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        application_id: application
+            .and_then(|a| a.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        fetched_at,
+        timestamp: event
+            .get("date")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(fetched_at),
+        view_name: view
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        view_url: view
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        duration_ms: view.get("time_spent").and_then(|v| v.as_i64()).unwrap_or(0) as f64
+            / 1_000_000.0,
+        loading_time_ms: view
+            .get("loading_time")
+            .and_then(|v| v.as_i64())
+            .map(|t| t as f64 / 1_000_000.0)
+            .unwrap_or(0.0),
+        error_count: view
+            .get("error")
+            .and_then(|e| e.get("count"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        resource_count: view
+            .get("resource")
+            .and_then(|r| r.get("count"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        action_count: view
+            .get("action")
+            .and_then(|a| a.get("count"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        long_task_count: view
+            .get("long_task")
+            .and_then(|lt| lt.get("count"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        user_id: event
+            .get("usr")
+            .and_then(|u| u.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        user_email: event
+            .get("usr")
+            .and_then(|u| u.get("email"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        user_name: event
+            .get("usr")
+            .and_then(|u| u.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        device_type: event
+            .get("device")
+            .and_then(|d| d.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        os_name: event
+            .get("os")
+            .and_then(|o| o.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        os_version: event
+            .get("os")
+            .and_then(|o| o.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        browser_name: event
+            .get("context")
+            .and_then(|c| c.get("browser"))
+            .and_then(|b| b.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        browser_version: event
+            .get("context")
+            .and_then(|c| c.get("browser"))
+            .and_then(|b| b.get("version"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        country: event
+            .get("geo")
+            .and_then(|g| g.get("country"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        city: event
+            .get("geo")
+            .and_then(|g| g.get("city"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        raw_view_json: serde_json::to_string(event).unwrap_or_default(),
+    })
+}
+
+/// Parse a RUM resource event
+fn parse_rum_resource_event(
+    event: &serde_json::Value,
+    fetched_at: i64,
+) -> anyhow::Result<roxy_core::clickhouse::DatadogRumResourceRecord> {
+    use roxy_core::clickhouse::DatadogRumResourceRecord;
+
+    let resource = event
+        .get("resource")
+        .ok_or_else(|| anyhow::anyhow!("Missing resource field"))?;
+    let view = event.get("view");
+    let session = event.get("session");
+    let application = event.get("application");
+
+    Ok(DatadogRumResourceRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        resource_id: resource
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        view_id: view
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        session_id: session
+            .and_then(|s| s.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        application_id: application
+            .and_then(|a| a.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        fetched_at,
+        timestamp: event
+            .get("date")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(fetched_at),
+        resource_url: resource
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        resource_type: resource
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        method: resource
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        status_code: resource
+            .get("status_code")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        duration_ms: resource
+            .get("duration")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as f64
+            / 1_000_000.0,
+        size_bytes: resource.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
+        trace_id: resource
+            .get("connect")
+            .and_then(|c| c.get("trace_id"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                event
+                    .get("_dd")
+                    .and_then(|dd| dd.get("trace_id"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("")
+            .to_string(),
+        span_id: resource
+            .get("connect")
+            .and_then(|c| c.get("span_id"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                event
+                    .get("_dd")
+                    .and_then(|dd| dd.get("span_id"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("")
+            .to_string(),
+        dns_duration_ms: resource
+            .get("dns")
+            .and_then(|d| d.get("duration"))
+            .and_then(|v| v.as_i64())
+            .map(|d| d as f64 / 1_000_000.0)
+            .unwrap_or(0.0),
+        connect_duration_ms: resource
+            .get("connect")
+            .and_then(|c| c.get("duration"))
+            .and_then(|v| v.as_i64())
+            .map(|d| d as f64 / 1_000_000.0)
+            .unwrap_or(0.0),
+        ssl_duration_ms: resource
+            .get("ssl")
+            .and_then(|s| s.get("duration"))
+            .and_then(|v| v.as_i64())
+            .map(|d| d as f64 / 1_000_000.0)
+            .unwrap_or(0.0),
+        download_duration_ms: resource
+            .get("download")
+            .and_then(|d| d.get("duration"))
+            .and_then(|v| v.as_i64())
+            .map(|d| d as f64 / 1_000_000.0)
+            .unwrap_or(0.0),
+        first_byte_duration_ms: resource
+            .get("first_byte")
+            .and_then(|fb| fb.get("duration"))
+            .and_then(|v| v.as_i64())
+            .map(|d| d as f64 / 1_000_000.0)
+            .unwrap_or(0.0),
+        provider_name: resource
+            .get("provider")
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        provider_type: resource
+            .get("provider")
+            .and_then(|p| p.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        raw_resource_json: serde_json::to_string(event).unwrap_or_default(),
+    })
 }
 
 // Platform-specific system proxy configuration
@@ -1174,6 +1563,7 @@ impl ProxyServer {
             gateway_router: tokio::sync::Mutex::new(GatewayRouter::new()),
             active_k8s_connections: active_k8s_connections.clone(),
             tls_manager,
+            auto_port_forward_enabled: Arc::new(AtomicBool::new(true)), // Enabled by default
         });
 
         // Create SOCKS5 proxy if enabled, with ClickHouse for protocol interception
@@ -1285,6 +1675,17 @@ impl ProxyServer {
             });
         }
 
+        // Start control API server (shares the same Arc<AtomicBool> with state)
+        let control_server = control::ControlServer::new(
+            control::DEFAULT_CONTROL_PORT,
+            self.state.auto_port_forward_enabled.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = control_server.run().await {
+                error!("Control API server error: {}", e);
+            }
+        });
+
         info!("=================================================");
         info!("  Roxy Proxy is running!");
         info!("  HTTP Proxy: http://127.0.0.1:{}", self.config.port);
@@ -1300,6 +1701,10 @@ impl ProxyServer {
                 self.config.mcp.bind_address.port()
             );
         }
+        info!(
+            "  Control:    http://127.0.0.1:{}",
+            control::DEFAULT_CONTROL_PORT
+        );
         info!("  ClickHouse: http://127.0.0.1:8123");
         info!("  OTel:       http://127.0.0.1:4317 (gRPC)");
         if let Some(tls) = &self.tls_manager {

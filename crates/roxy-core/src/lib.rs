@@ -9,6 +9,7 @@
 //! - Proxy subprocess manager
 
 pub mod clickhouse;
+pub mod config;
 pub mod models;
 pub mod proxy_manager;
 pub mod routing;
@@ -23,8 +24,8 @@ pub use models::{
 
 pub use clickhouse::{
     ActiveK8sConnection, ClickHouseConfig, ClientServiceSummary, ConnectionStatus,
-    DatabaseQueryRow, HostSummary, HttpRequestRecord, KafkaMessageRow, RoxyClickHouse, SpanRecord,
-    TcpConnectionRow,
+    DatabaseQueryRow, DatadogRumResourceRecord, DatadogRumViewRecord, DatadogSpanRecord,
+    HostSummary, HttpRequestRecord, KafkaMessageRow, RoxyClickHouse, SpanRecord, TcpConnectionRow,
 };
 
 pub use services::{ManagedService, ServiceManager};
@@ -42,3 +43,5 @@ pub use routing::{
     RemoteTarget, RequestInfo, RequestModification, RoutingRule, RoutingRuleSet, RuleAction,
     ServicePort,
 };
+
+pub use config::{ClickHouseSettings, DatadogConfig, ProxyConfig, RoxyConfig};

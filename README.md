@@ -589,6 +589,61 @@ For Claude Desktop (stdio transport), use the standalone binary:
 }
 ```
 
+### Control API
+
+Roxy includes an HTTP control API for runtime configuration without restarting the proxy. The API runs on port 8889 and is accessible only from localhost.
+
+**Base URL:** `http://127.0.0.1:8889`
+
+**Available Endpoints:**
+- `POST /control` - Send control commands (enable/disable features)
+- `GET /status` - Get current proxy configuration status
+- `GET /health` - Health check
+
+**Example: Toggle Auto Port-Forward**
+
+```bash
+# Enable auto port-forwarding for Kubernetes HTTPRoute services
+curl -X POST http://127.0.0.1:8889/control \
+  -H "Content-Type: application/json" \
+  -d '{"command":"set_auto_port_forward","enabled":true}'
+
+# Disable auto port-forwarding
+curl -X POST http://127.0.0.1:8889/control \
+  -H "Content-Type: application/json" \
+  -d '{"command":"set_auto_port_forward","enabled":false}'
+
+# Get current status
+curl http://127.0.0.1:8889/status
+```
+
+**From Rust:**
+
+```rust
+use roxy_core::proxy_manager::{ProxyManager, ControlCommand};
+
+let manager = ProxyManager::with_defaults();
+manager.set_auto_port_forward(true).await?;
+```
+
+**From TypeScript/JavaScript:**
+
+```typescript
+const response = await fetch('http://127.0.0.1:8889/control', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    command: 'set_auto_port_forward',
+    enabled: true
+  })
+});
+```
+
+For complete API documentation, see:
+- [Control API Documentation](crates/roxy-proxy/CONTROL_API.md)
+- [OpenAPI Specification](crates/roxy-proxy/openapi.yaml)
+- [Test Script](crates/roxy-proxy/test_control_api.sh)
+
 ### Running Proxy Standalone
 
 If you want to run just the proxy (e.g., on Linux without the UI):

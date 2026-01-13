@@ -26,6 +26,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 
+# HTTP client for control API
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
 # Directories
 dirs = "5.0"
 

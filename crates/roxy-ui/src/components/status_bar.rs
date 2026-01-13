@@ -24,6 +24,11 @@ pub struct StatusBarProps {
     /// Callback when system proxy toggle is clicked
     pub on_system_proxy_toggle:
         Option<std::sync::Arc<dyn Fn(bool, &mut App) + Send + Sync + 'static>>,
+    /// Whether auto port-forward is enabled for HTTPRoute K8s services
+    pub auto_port_forward_enabled: bool,
+    /// Callback when auto port-forward toggle is clicked
+    pub on_auto_port_forward_toggle:
+        Option<std::sync::Arc<dyn Fn(bool, &mut App) + Send + Sync + 'static>>,
 }
 
 /// Status bar component
@@ -70,6 +75,7 @@ impl StatusBar {
             ))
             .child(self.render_service_status("OTel", "127.0.0.1:4317", self.props.otel_connected))
             .child(self.render_system_proxy_toggle())
+            .child(self.render_auto_port_forward_toggle())
     }
 
     /// Render the request count indicator
@@ -136,6 +142,58 @@ impl StatusBar {
             "System Proxy: ON"
         } else {
             "System Proxy: OFF"
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap(spacing::XS)
+            .cursor_pointer()
+            .child(
+                // Toggle switch
+                div()
+                    .w(px(32.0))
+                    .h(px(16.0))
+                    .rounded(px(8.0))
+                    .bg(bg_color)
+                    .flex()
+                    .items_center()
+                    .px(px(2.0))
+                    .child(
+                        div()
+                            .size(px(12.0))
+                            .rounded(px(6.0))
+                            .bg(indicator_color)
+                            .when(enabled, |d| d.ml(px(14.0))),
+                    ),
+            )
+            .child(label)
+            .when_some(on_toggle, |el, callback| {
+                el.on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                    callback(!enabled, cx);
+                })
+            })
+    }
+
+    /// Render the auto port-forward toggle
+    fn render_auto_port_forward_toggle(&self) -> impl IntoElement {
+        let enabled = self.props.auto_port_forward_enabled;
+        let on_toggle = self.props.on_auto_port_forward_toggle.clone();
+
+        let bg_color = if enabled {
+            self.theme.success
+        } else {
+            rgb(colors::SURFACE_1).into()
+        };
+        let indicator_color = if enabled {
+            rgb(colors::BASE)
+        } else {
+            self.theme.text_muted.into()
+        };
+        let label = if enabled {
+            "Auto K8s Port-Forward: ON"
+        } else {
+            "Auto K8s Port-Forward: OFF"
         };
 
         div()

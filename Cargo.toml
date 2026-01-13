@@ -7,6 +7,9 @@ members = [
     "crates/roxy-mcp",
     "xtask",
 ]
+exclude = [
+    "examples/fullstack-k8s-dev",
+]
 
 [workspace.package]
 version = "0.1.0"

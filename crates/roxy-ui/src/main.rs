@@ -226,6 +226,50 @@ impl RoxyApp {
                         }
                     }
 
+                    // Poll for RUM views
+                    tracing::debug!("[POLLER] Poll #{}: Querying RUM views...", poll_count);
+                    match clickhouse.get_recent_datadog_rum_views(100).await {
+                        Ok(views) => {
+                            tracing::info!(
+                                "[POLLER] Poll #{}: SUCCESS - Got {} RUM views from ClickHouse",
+                                poll_count,
+                                views.len()
+                            );
+                            if let Err(e) = poll_tx.send(UiMessage::RumViewsUpdated(views)) {
+                                tracing::error!("[POLLER] Failed to send RUM views to UI: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "[POLLER] Poll #{}: No RUM views available: {:?}",
+                                poll_count,
+                                e
+                            );
+                        }
+                    }
+
+                    // Poll for RUM resources
+                    tracing::debug!("[POLLER] Poll #{}: Querying RUM resources...", poll_count);
+                    match clickhouse.get_recent_datadog_rum_resources(500).await {
+                        Ok(resources) => {
+                            tracing::info!(
+                                "[POLLER] Poll #{}: SUCCESS - Got {} RUM resources from ClickHouse",
+                                poll_count,
+                                resources.len()
+                            );
+                            if let Err(e) = poll_tx.send(UiMessage::RumResourcesUpdated(resources)) {
+                                tracing::error!("[POLLER] Failed to send RUM resources to UI: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "[POLLER] Poll #{}: No RUM resources available: {:?}",
+                                poll_count,
+                                e
+                            );
+                        }
+                    }
+
                     // Poll for TCP connections (unknown protocols only)
                     tracing::debug!("[POLLER] Poll #{}: Querying TCP connections...", poll_count);
                     match clickhouse.get_recent_connections(100).await {
@@ -491,6 +535,28 @@ impl RoxyApp {
             })
         };
 
+        // View selection callback
+        let on_view_select: Arc<dyn Fn(String, &mut App) + Send + Sync + 'static> = {
+            let entity = entity.clone();
+            Arc::new(move |view_name: String, cx: &mut App| {
+                entity.update(cx, |app, cx| {
+                    app.state.select_rum_view(view_name);
+                    cx.notify();
+                });
+            })
+        };
+
+        // Clear view filter callback
+        let on_clear_view_filter: Arc<dyn Fn(&mut App) + Send + Sync + 'static> = {
+            let entity = entity.clone();
+            Arc::new(move |cx: &mut App| {
+                entity.update(cx, |app, cx| {
+                    app.state.clear_rum_view_filter();
+                    cx.notify();
+                });
+            })
+        };
+
         // Kubernetes context selection callback
         let on_context_select: Arc<dyn Fn(&str, &mut App) + Send + Sync + 'static> = {
             let entity = entity.clone();
@@ -559,6 +625,10 @@ impl RoxyApp {
             proxy_status: self.state.proxy_status.clone(),
             hosts: all_hosts,
             selected_host,
+            rum_views: self.state.rum_views.clone(),
+            selected_rum_view: self.state.selected_rum_view.clone(),
+            rum_resources: self.state.rum_resources.clone(),
+            rum_views_scroll_handle: self.state.rum_views_scroll_handle.clone(),
             services: self.state.services.clone(),
             selected_service: self.state.selected_service.clone(),
             kube_contexts: self.state.kube_contexts.clone(),
@@ -567,6 +637,8 @@ impl RoxyApp {
             selected_namespace: self.state.selected_kube_namespace.clone(),
             on_host_select: Some(on_host_select),
             on_clear_host_filter: Some(on_clear_host_filter),
+            on_view_select: Some(on_view_select),
+            on_clear_view_filter: Some(on_clear_view_filter),
             on_service_select: Some(on_service_select),
             on_clear_service_filter: Some(on_clear_service_filter),
             on_namespace_select: Some(on_namespace_select),
@@ -739,6 +811,9 @@ impl RoxyApp {
             .when(self.state.view_mode == ViewMode::Kubernetes, |this| {
                 this.child(self.render_kubernetes_panel(cx))
             })
+            .when(self.state.view_mode == ViewMode::RumViews, |this| {
+                this.child(self.render_rum_views_panel(cx))
+            })
     }
 
     /// Render the toolbar component with view switcher (HTTP/Database/Messaging/TCP)
@@ -783,6 +858,7 @@ impl RoxyApp {
                             format!("{} connections", self.state.tcp_connections.len())
                         }
                         ViewMode::Kubernetes => String::new(), // Not shown in toolbar mode
+                        ViewMode::RumViews => String::new(),   // Not shown in toolbar mode
                     }),
             )
     }
@@ -846,6 +922,123 @@ impl RoxyApp {
         };
 
         KubernetesPanel::new(props).render()
+    }
+
+    /// Render the RUM views panel showing view → service graph
+    fn render_rum_views_panel(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::theme::{colors, font_size, spacing};
+
+        // Get view → service mappings for the selected view (or all if none selected)
+        let mappings = self
+            .state
+            .get_view_service_mappings(self.state.selected_rum_view.as_deref());
+
+        let title = if let Some(ref view_name) = self.state.selected_rum_view {
+            format!("View: {}", view_name)
+        } else {
+            "All Views → Services".to_string()
+        };
+
+        // For now, render a simple list. Later we'll add a proper graph visualization
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(colors::BASE))
+            .p(spacing::MD)
+            .child(
+                div()
+                    .text_size(font_size::LG)
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(colors::TEXT))
+                    .mb(spacing::MD)
+                    .child(title),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(spacing::SM)
+                    .flex_1()
+                    .id("rum-views-list")
+                    .overflow_y_scroll()
+                    .children(mappings.iter().map(
+                        |(view, service, namespace, url, count)| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(spacing::XXS)
+                                .p(spacing::SM)
+                                .rounded(px(8.0))
+                                .bg(rgb(colors::SURFACE_0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(spacing::SM)
+                                        .child(
+                                            div()
+                                                .text_size(font_size::MD)
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(rgb(colors::TEXT))
+                                                .child(format!("{} → {}", view, service)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(font_size::SM)
+                                                .text_color(rgb(colors::SUBTEXT_0))
+                                                .child(format!("{} calls", count)),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(font_size::SM)
+                                        .text_color(rgb(colors::SUBTEXT_1))
+                                        .child(format!("namespace: {}", namespace)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(font_size::XS)
+                                        .text_color(rgb(colors::SUBTEXT_0))
+                                        .child(url.clone()),
+                                )
+                        },
+                    )),
+            )
+            .when(mappings.is_empty(), |this| {
+                let view_count = self.state.rum_views.len();
+                let resource_count = self.state.rum_resources.len();
+                let route_count = self.state.k8s_http_routes.len();
+
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap(spacing::SM)
+                        .h(px(300.0))
+                        .text_size(font_size::MD)
+                        .text_color(rgb(colors::SUBTEXT_0))
+                        .child("No view → service mappings found")
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(spacing::XS)
+                                .text_size(font_size::SM)
+                                .child(format!("• {} RUM views loaded", view_count))
+                                .child(format!("• {} RUM resources (API calls) loaded", resource_count))
+                                .child(format!("• {} Kubernetes HTTPRoutes configured", route_count))
+                        )
+                        .child(
+                            div()
+                                .text_size(font_size::SM)
+                                .text_color(rgb(colors::SUBTEXT_1))
+                                .child("Tip: Make sure you have RUM data from Datadog and Kubernetes HTTPRoutes configured")
+                        )
+                )
+            })
     }
 
     /// Render the request list component
@@ -1094,6 +1287,61 @@ impl RoxyApp {
                 });
             });
 
+        let entity2 = cx.entity().clone();
+        let on_auto_port_forward_toggle: std::sync::Arc<
+            dyn Fn(bool, &mut App) + Send + Sync + 'static,
+        > = std::sync::Arc::new(move |enabled: bool, cx: &mut App| {
+            entity2.update(cx, |app, cx| {
+                app.state.set_auto_port_forward_enabled(enabled);
+                if enabled {
+                    tracing::info!(
+                        "Auto port-forward enabled - HTTPRoute K8s services will auto-forward"
+                    );
+                } else {
+                    tracing::info!("Auto port-forward disabled");
+                }
+
+                // Send control command to proxy via HTTP
+                let enabled_copy = enabled;
+                std::thread::spawn(move || {
+                    let rt =
+                        tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+                    rt.block_on(async move {
+                        let client = reqwest::Client::new();
+                        let command = serde_json::json!({
+                            "command": "set_auto_port_forward",
+                            "enabled": enabled_copy
+                        });
+
+                        match client
+                            .post("http://127.0.0.1:8889/control")
+                            .json(&command)
+                            .send()
+                            .await
+                        {
+                            Ok(response) => {
+                                if response.status().is_success() {
+                                    tracing::info!(
+                                        "Successfully sent auto port-forward command to proxy"
+                                    );
+                                } else {
+                                    tracing::error!(
+                                        "Failed to send control command: status {}",
+                                        response.status()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to send control command to proxy: {}", e);
+                            }
+                        }
+                    });
+                });
+
+                cx.notify();
+            });
+        });
+
         StatusBar::new(StatusBarProps {
             request_count: self.state.request_count(),
             error_message: self.state.error_message.clone(),
@@ -1101,6 +1349,8 @@ impl RoxyApp {
             otel_connected: true,       // TODO: actual connection check
             system_proxy_enabled: self.state.system_proxy_enabled,
             on_system_proxy_toggle: Some(on_system_proxy_toggle),
+            auto_port_forward_enabled: self.state.auto_port_forward_enabled,
+            on_auto_port_forward_toggle: Some(on_auto_port_forward_toggle),
         })
         .render()
     }

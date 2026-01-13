@@ -117,6 +117,8 @@ pub enum ViewMode {
     TCP,
     /// Show Kubernetes overview
     Kubernetes,
+    /// Show RUM views → services graph
+    RumViews,
 }
 
 impl ViewMode {
@@ -127,6 +129,7 @@ impl ViewMode {
             ViewMode::Messaging => "Messaging",
             ViewMode::TCP => "TCP",
             ViewMode::Kubernetes => "Kubernetes",
+            ViewMode::RumViews => "Views",
         }
     }
 }
@@ -140,6 +143,10 @@ pub enum UiMessage {
     HostsUpdated(Vec<HostSummary>),
     /// New client services fetched from ClickHouse
     ServicesUpdated(Vec<ClientServiceSummary>),
+    /// New RUM views fetched from ClickHouse
+    RumViewsUpdated(Vec<roxy_core::DatadogRumViewRecord>),
+    /// New RUM resources fetched from ClickHouse
+    RumResourcesUpdated(Vec<roxy_core::DatadogRumResourceRecord>),
     /// New TCP connections fetched from ClickHouse
     ConnectionsUpdated(Vec<TcpConnectionRow>),
     /// New database queries fetched from ClickHouse
@@ -236,6 +243,9 @@ pub struct AppState {
 
     /// Whether the system proxy is enabled (routes all macOS traffic through Roxy)
     pub system_proxy_enabled: bool,
+
+    /// Whether auto port-forwarding is enabled for HTTPRoute K8s services
+    pub auto_port_forward_enabled: bool,
 
     /// List of hosts from ClickHouse
     pub hosts: Vec<HostSummary>,
@@ -366,6 +376,18 @@ pub struct AppState {
     /// Currently active tab in the left dock
     pub left_dock_tab: LeftDockTab,
 
+    /// List of RUM views from Datadog
+    pub rum_views: Vec<roxy_core::DatadogRumViewRecord>,
+
+    /// Currently selected RUM view (None = "All Views")
+    pub selected_rum_view: Option<String>,
+
+    /// Scroll handle for RUM views list
+    pub rum_views_scroll_handle: ScrollHandle,
+
+    /// List of RUM resources (API calls) associated with views
+    pub rum_resources: Vec<roxy_core::DatadogRumResourceRecord>,
+
     /// List of connected services/apps
     pub services: Vec<ServiceSummary>,
 
@@ -408,6 +430,7 @@ impl AppState {
             proxy_running: Arc::new(AtomicBool::new(false)),
             proxy_status: ProxyStatus::Stopped,
             system_proxy_enabled: false,
+            auto_port_forward_enabled: true, // Enabled by default
             hosts: Vec::new(),
             requests: Vec::new(),
             selected_host: None,
@@ -451,6 +474,10 @@ impl AppState {
             messaging_detail_scroll_handle: ScrollHandle::new(),
             // Left dock state
             left_dock_tab: LeftDockTab::default(),
+            rum_views: Vec::new(),
+            selected_rum_view: None,
+            rum_views_scroll_handle: ScrollHandle::new(),
+            rum_resources: Vec::new(),
             services: Vec::new(),
             selected_service: None,
             services_scroll_handle: ScrollHandle::new(),
@@ -506,6 +533,12 @@ impl AppState {
                         avg_duration_ms: cs.avg_duration_ms,
                     })
                     .collect();
+            }
+            UiMessage::RumViewsUpdated(views) => {
+                self.rum_views = views;
+            }
+            UiMessage::RumResourcesUpdated(resources) => {
+                self.rum_resources = resources;
             }
             UiMessage::ConnectionsUpdated(connections) => {
                 self.tcp_connections = connections;
@@ -631,6 +664,30 @@ impl AppState {
     /// Clear the host filter
     pub fn clear_host_filter(&mut self) {
         self.selected_host = None;
+    }
+
+    /// Select a RUM view filter and switch to RumViews mode
+    pub fn select_rum_view(&mut self, view_name: String) {
+        self.selected_rum_view = Some(view_name);
+        self.view_mode = ViewMode::RumViews;
+
+        // Load Kubernetes contexts and resources if not already loaded
+        // (needed for view → service mapping)
+        if self.kube_contexts.is_empty() {
+            self.load_kube_contexts();
+        }
+    }
+
+    /// Clear the RUM view filter and switch to RumViews mode to show all views
+    pub fn clear_rum_view_filter(&mut self) {
+        self.selected_rum_view = None;
+        self.view_mode = ViewMode::RumViews;
+
+        // Load Kubernetes contexts and resources if not already loaded
+        // (needed for view → service mapping)
+        if self.kube_contexts.is_empty() {
+            self.load_kube_contexts();
+        }
     }
 
     /// Select a broker filter for messaging view
@@ -840,7 +897,8 @@ impl AppState {
             ViewMode::Database => ViewMode::Messaging,
             ViewMode::Messaging => ViewMode::TCP,
             ViewMode::TCP => ViewMode::Kubernetes,
-            ViewMode::Kubernetes => ViewMode::Requests,
+            ViewMode::Kubernetes => ViewMode::RumViews,
+            ViewMode::RumViews => ViewMode::Requests,
         };
     }
 
@@ -861,6 +919,15 @@ impl AppState {
 
     pub fn is_system_proxy_enabled(&self) -> bool {
         self.system_proxy_enabled
+    }
+
+    /// Toggle auto port-forward on/off
+    pub fn set_auto_port_forward_enabled(&mut self, enabled: bool) {
+        self.auto_port_forward_enabled = enabled;
+    }
+
+    pub fn is_auto_port_forward_enabled(&self) -> bool {
+        self.auto_port_forward_enabled
     }
 
     // =========================================================================
@@ -983,6 +1050,129 @@ impl AppState {
                 rt.block_on(load_kubernetes_resources(context, namespace, tx));
             });
         }
+    }
+
+    /// Get view → service mappings for a specific view (or all views if None)
+    /// Returns (view_name, service_name, service_namespace, resource_url, count)
+    pub fn get_view_service_mappings(
+        &self,
+        view_name: Option<&str>,
+    ) -> Vec<(String, String, String, String, usize)> {
+        // Filter resources by view if specified
+        let resources: Vec<_> = match view_name {
+            Some(name) => self
+                .rum_resources
+                .iter()
+                .filter(|r| {
+                    // Find matching view by view_id
+                    self.rum_views
+                        .iter()
+                        .any(|v| v.view_id == r.view_id && v.view_name == name)
+                })
+                .collect(),
+            None => self.rum_resources.iter().collect(),
+        };
+
+        // Build mappings: resource URL → (view_name, service_name, namespace)
+        let mut mappings: std::collections::HashMap<(String, String, String, String), usize> =
+            std::collections::HashMap::new();
+
+        for resource in resources {
+            // Find the view name for this resource
+            let view = self
+                .rum_views
+                .iter()
+                .find(|v| v.view_id == resource.view_id);
+            let resource_view_name = match view {
+                Some(v) => v.view_name.clone(),
+                None => continue,
+            };
+
+            // Try to match this resource URL to a Kubernetes route
+            if let Some((service_name, namespace)) =
+                self.match_resource_to_k8s_service(&resource.resource_url)
+            {
+                let key = (
+                    resource_view_name.clone(),
+                    service_name.clone(),
+                    namespace.clone(),
+                    resource.resource_url.clone(),
+                );
+                *mappings.entry(key).or_insert(0) += 1;
+            }
+        }
+
+        // Convert to vec and sort by count descending
+        let mut result: Vec<_> = mappings
+            .into_iter()
+            .map(|((view, svc, ns, url), count)| (view, svc, ns, url, count))
+            .collect();
+        result.sort_by(|a, b| b.4.cmp(&a.4));
+
+        result
+    }
+
+    /// Match a resource URL to a Kubernetes service using HTTPRoutes
+    fn match_resource_to_k8s_service(&self, resource_url: &str) -> Option<(String, String)> {
+        // Parse the URL to extract host and path
+        let url = match url::Url::parse(resource_url) {
+            Ok(u) => u,
+            Err(e) => {
+                debug!("Failed to parse resource URL '{}': {}", resource_url, e);
+                return None;
+            }
+        };
+
+        let host = url.host_str()?;
+        let path = url.path();
+
+        debug!("Matching resource: host={}, path={}", host, path);
+
+        // Try to match against HTTPRoutes
+        for route in &self.k8s_http_routes {
+            debug!(
+                "  Checking route '{}' with hostnames={:?}, paths={:?}",
+                route.name, route.hostnames, route.paths
+            );
+
+            // Check if hostname matches
+            let hostname_matches = route.hostnames.is_empty()
+                || route.hostnames.iter().any(|h| {
+                    // Support wildcards like *.example.com
+                    if h.starts_with("*.") {
+                        let suffix = &h[2..];
+                        host.ends_with(suffix)
+                    } else {
+                        host == h
+                    }
+                });
+
+            if !hostname_matches {
+                continue;
+            }
+
+            // Check if path matches
+            let path_matches = route.paths.is_empty()
+                || route.paths.iter().any(|p| {
+                    // Support prefix matching
+                    if p.ends_with('/') {
+                        path.starts_with(p)
+                    } else {
+                        path == p || path.starts_with(&format!("{}/", p))
+                    }
+                });
+
+            if !path_matches {
+                continue;
+            }
+
+            // Found a matching route! Return the first backend service
+            if let Some(backend) = route.backend_refs.first() {
+                return Some((backend.service_name.clone(), backend.namespace.clone()));
+            }
+        }
+
+        None
     }
 }
 
