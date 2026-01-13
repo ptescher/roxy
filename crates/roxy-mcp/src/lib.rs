@@ -8,11 +8,11 @@
 //! - `stdio` - Enable stdio transport for CLI usage (default)
 //! - `sse` - Enable SSE transport for remote/embedded usage
 
+pub mod datadog;
 mod tools;
-mod datadog;
 
-pub use tools::RoxyMcpServer;
 pub use datadog::DatadogClient;
+pub use tools::RoxyMcpServer;
 
 use anyhow::Result;
 use rmcp::ServiceExt;
@@ -21,6 +21,15 @@ use rmcp::ServiceExt;
 #[cfg(feature = "stdio")]
 pub async fn run_stdio() -> Result<()> {
     use rmcp::transport::io::stdio;
+
+    // Load config and export to environment
+    let config = roxy_core::RoxyConfig::load_with_env()?;
+    config.export_to_env()?;
+
+    tracing::info!(
+        config_path = ?roxy_core::RoxyConfig::config_path()?,
+        "Loaded Roxy configuration"
+    );
 
     let server = RoxyMcpServer::new().await?;
     let transport = stdio();

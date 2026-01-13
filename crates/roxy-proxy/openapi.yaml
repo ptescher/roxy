@@ -1,0 +1,182 @@
+openapi: 3.0.3
+info:
+  title: Roxy Control API
+  description: |
+    HTTP control API for runtime configuration of the Roxy proxy.
+    This API allows the UI and other clients to control proxy behavior at runtime.
+  version: 0.1.0
+  contact:
+    name: Roxy Contributors
+    url: https://github.com/yourusername/roxy
+
+servers:
+  - url: http://127.0.0.1:8889
+    description: Local control API server
+
+tags:
+  - name: control
+    description: Runtime control operations
+  - name: health
+    description: Health and status checks
+
+paths:
+  /control:
+    post:
+      summary: Send control command
+      description: Send a control command to modify proxy behavior at runtime
+      operationId: sendControlCommand
+      tags:
+        - control
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ControlCommand'
+            examples:
+              enableAutoPortForward:
+                summary: Enable auto port-forwarding
+                value:
+                  command: set_auto_port_forward
+                  enabled: true
+              disableAutoPortForward:
+                summary: Disable auto port-forwarding
+                value:
+                  command: set_auto_port_forward
+                  enabled: false
+              getStatus:
+                summary: Get current status
+                value:
+                  command: get_status
+      responses:
+        '200':
+          description: Command executed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              examples:
+                success:
+                  summary: Successful command
+                  value:
+                    success: true
+                    message: "Auto port-forward enabled"
+                statusResponse:
+                  summary: Status response
+                  value:
+                    success: true
+                    message: "Status retrieved"
+                    data:
+                      auto_port_forward_enabled: true
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              example:
+                success: false
+                message: "Invalid command format"
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              example:
+                success: false
+                message: "Failed to execute command"
+
+  /health:
+    get:
+      summary: Health check
+      description: Check if the control API is running
+      operationId: healthCheck
+      tags:
+        - health
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "OK"
+
+  /status:
+    get:
+      summary: Get proxy status
+      description: Get current configuration status of the proxy
+      operationId: getStatus
+      tags:
+        - control
+      responses:
+        '200':
+          description: Status retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ControlResponse'
+              example:
+                success: true
+                message: "Status retrieved"
+                data:
+                  auto_port_forward_enabled: true
+
+components:
+  schemas:
+    ControlCommand:
+      type: object
+      required:
+        - command
+      discriminator:
+        propertyName: command
+        mapping:
+          set_auto_port_forward: '#/components/schemas/SetAutoPortForwardCommand'
+          get_status: '#/components/schemas/GetStatusCommand'
+      oneOf:
+        - $ref: '#/components/schemas/SetAutoPortForwardCommand'
+        - $ref: '#/components/schemas/GetStatusCommand'
+
+    SetAutoPortForwardCommand:
+      type: object
+      description: Enable or disable automatic port-forwarding for Kubernetes HTTPRoute services
+      required:
+        - command
+        - enabled
+      properties:
+        command:
+          type: string
+          enum: [set_auto_port_forward]
+          description: Command type identifier
+        enabled:
+          type: boolean
+          description: Whether to enable or disable auto port-forwarding
+
+    GetStatusCommand:
+      type: object
+      description: Get current proxy configuration status
+      required:
+        - command
+      properties:
+        command:
+          type: string
+          enum: [get_status]
+          description: Command type identifier
+
+    ControlResponse:
+      type: object
+      required:
+        - success
+        - message
+      properties:
+        success:
+          type: boolean
+          description: Whether the command succeeded
+        message:
+          type: string
+          description: Human-readable status message
+        data:
+          type: object
+          description: Optional response data
+          additionalProperties: true

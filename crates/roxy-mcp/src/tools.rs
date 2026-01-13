@@ -16,16 +16,30 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct RoxyMcpServer {
     clickhouse: Arc<RoxyClickHouse>,
+    datadog: Option<Arc<crate::datadog::DatadogClient>>,
 }
 
 impl RoxyMcpServer {
     /// Create a new MCP server instance, connecting to ClickHouse
     pub async fn new() -> Result<Self> {
         let config = ClickHouseConfig::default();
-        let clickhouse = RoxyClickHouse::new(config);
+        let clickhouse = Arc::new(RoxyClickHouse::new(config));
+
+        // Try to initialize Datadog client if credentials are available
+        let datadog = match crate::datadog::DatadogClient::new(clickhouse.clone()) {
+            Ok(client) => {
+                tracing::info!("Datadog integration enabled");
+                Some(Arc::new(client))
+            }
+            Err(e) => {
+                tracing::warn!("Datadog integration disabled: {}", e);
+                None
+            }
+        };
 
         Ok(Self {
-            clickhouse: Arc::new(clickhouse),
+            clickhouse,
+            datadog,
         })
     }
 
@@ -434,6 +448,141 @@ impl RoxyMcpServer {
 
         Ok(Self::text_result(json))
     }
+
+    // Datadog tools (only available if DD_API_KEY and DD_APP_KEY are set)
+
+    /// Query Datadog APM metrics
+    #[tool(
+        name = "datadog_query_apm_metrics",
+        description = "Query Datadog APM metrics for a service. Returns performance metrics like average duration, p95, p99."
+    )]
+    async fn datadog_query_apm_metrics(
+        &self,
+        #[tool(aggr)] params: QueryApmMetricsParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let client = self.datadog.as_ref().ok_or_else(|| {
+            Self::error_result(
+                "Datadog not configured. Set DD_API_KEY and DD_APP_KEY environment variables."
+                    .to_string(),
+            )
+        })?;
+
+        client.query_apm_metrics(params).await
+    }
+
+    /// Query Datadog APM traces
+    #[tool(
+        name = "datadog_query_apm_traces",
+        description = "Query Datadog APM traces to find slow requests. Returns a Datadog URL showing backend trace spans. WORKFLOW STEP 3: Use resource_name from RUM resources (e.g., 'GET /portfolio/v1/balances') to investigate backend performance. Filter by min_duration_ms to find slow requests. Analyze span hierarchy to identify bottlenecks (DB queries, external APIs, etc)."
+    )]
+    async fn datadog_query_apm_traces(
+        &self,
+        #[tool(aggr)] params: QueryApmTracesParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let client = self.datadog.as_ref().ok_or_else(|| {
+            Self::error_result(
+                "Datadog not configured. Set DD_API_KEY and DD_APP_KEY environment variables."
+                    .to_string(),
+            )
+        })?;
+
+        client.query_apm_traces(params).await
+    }
+
+    /// Query Datadog logs
+    #[tool(
+        name = "datadog_query_logs",
+        description = "Query Datadog logs for errors and events."
+    )]
+    async fn datadog_query_logs(
+        &self,
+        #[tool(aggr)] params: QueryLogsParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let client = self.datadog.as_ref().ok_or_else(|| {
+            Self::error_result(
+                "Datadog not configured. Set DD_API_KEY and DD_APP_KEY environment variables."
+                    .to_string(),
+            )
+        })?;
+
+        client.query_logs(params).await
+    }
+
+    /// Query Datadog RUM views
+    #[tool(
+        name = "datadog_query_rum_views",
+        description = "Query Datadog RUM views (screens/pages). Returns a Datadog URL showing mobile app screen performance. WORKFLOW STEP 1: Use this first to identify slow screens and get view IDs. Then use datadog_query_rum_resources with the view_id to see what API calls are made."
+    )]
+    async fn datadog_query_rum_views(
+        &self,
+        #[tool(aggr)] params: QueryRumViewsParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let client = self.datadog.as_ref().ok_or_else(|| {
+            Self::error_result(
+                "Datadog not configured. Set DD_API_KEY and DD_APP_KEY environment variables."
+                    .to_string(),
+            )
+        })?;
+
+        client.query_rum_views(params).await
+    }
+
+    /// Query Datadog RUM resources
+    #[tool(
+        name = "datadog_query_rum_resources",
+        description = "Query Datadog RUM resources (API calls/XHR/Fetch). Returns a Datadog URL showing HTTP requests made by the mobile app. WORKFLOW STEP 2: Use view_id from datadog_query_rum_views to filter resources for a specific screen. Group by @resource.url in Datadog UI to find slow/frequent endpoints. Then use datadog_query_apm_traces to investigate backend performance."
+    )]
+    async fn datadog_query_rum_resources(
+        &self,
+        #[tool(aggr)] params: QueryRumResourcesParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let client = self.datadog.as_ref().ok_or_else(|| {
+            Self::error_result(
+                "Datadog not configured. Set DD_API_KEY and DD_APP_KEY environment variables."
+                    .to_string(),
+            )
+        })?;
+
+        client.query_rum_resources(params).await
+    }
+
+    /// Query Datadog RUM sessions
+    #[tool(
+        name = "datadog_query_rum_sessions",
+        description = "Query Datadog RUM sessions. Use this to see complete user journeys."
+    )]
+    async fn datadog_query_rum_sessions(
+        &self,
+        #[tool(aggr)] params: QueryRumSessionsParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let client = self.datadog.as_ref().ok_or_else(|| {
+            Self::error_result(
+                "Datadog not configured. Set DD_API_KEY and DD_APP_KEY environment variables."
+                    .to_string(),
+            )
+        })?;
+
+        client.query_rum_sessions(params).await
+    }
+
+    /// Fetch and analyze trace spans from Datadog Spans API
+    #[tool(
+        name = "datadog_fetch_trace_spans",
+        description = "Fetch spans using Datadog Spans API v2 (NOT Traces API). Can search by trace_id OR by service+resource_name. CRITICAL for performance investigation: detects if operations run in parallel or sequential (identify parallelization opportunities), extracts SQL queries with timing (find slow queries), shows full span waterfall. WORKFLOW: 1) If you have trace_id from RUM, use it directly. 2) If no trace_id, search by service + resource_name to find matching traces."
+    )]
+    async fn datadog_fetch_trace_spans(
+        &self,
+        #[tool(aggr)] params: FetchTraceSpansParams,
+    ) -> Result<CallToolResult, rmcp::Error> {
+        let client = self.datadog.as_ref().ok_or_else(|| {
+            Self::error_result(
+                "Datadog not configured. Set DD_API_KEY and DD_APP_KEY environment variables."
+                    .to_string(),
+            )
+        })?;
+
+        client.fetch_trace_spans(params).await
+    }
 }
 
 #[tool(tool_box)]
@@ -441,10 +590,43 @@ impl ServerHandler for RoxyMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "Roxy MCP server provides access to network observability data. \
-                 Query HTTP requests, distributed traces, database queries, and Kafka messages. \
-                 Use get_recent_http_requests to see recent traffic, get_trace_spans to explore \
-                 a specific trace, and search_http_requests to find specific requests."
+                "Roxy MCP server provides access to network observability data and Datadog telemetry.\n\n\
+                 == Roxy Network Observability ==\n\
+                 - get_recent_http_requests: See HTTP traffic captured by Roxy proxy\n\
+                 - get_trace_spans: View distributed traces across services\n\
+                 - get_recent_database_queries: Inspect database queries\n\
+                 - get_recent_kafka_messages: View Kafka message traffic\n\
+                 - search_http_requests: Search across request/response bodies\n\n\
+                 == Datadog RUM (Real User Monitoring) Workflow ==\n\
+                 Use this workflow to investigate mobile app performance:\n\n\
+                 1. datadog_query_rum_views - Find slow screens\n\
+                    • Query for specific view names (e.g., view_name=\"Home\")\n\
+                    • Returns Datadog URL with view performance data\n\
+                    • Note the view_id from the results\n\n\
+                 2. datadog_query_rum_resources - See API calls for that view\n\
+                    • Use the view_id from step 1\n\
+                    • Shows all API requests made during screen load\n\
+                    • Group by @resource.url in Datadog UI to see aggregated stats\n\
+                    • Identify slow or frequently called endpoints\n\n\
+                 3. datadog_fetch_trace_spans - Deep dive into trace execution ⭐ NEW\n\
+                    • Use trace_id from RUM resources OR search by service+resource_name\n\
+                    • Detects parallel vs sequential execution patterns\n\
+                    • Extracts SQL queries with timing (find slow queries)\n\
+                    • Shows complete span waterfall with parent/child relationships\n\n\
+                 Example: \"Home tab is slow\" investigation:\n\
+                 - Query RUM views for \"Home\" → get view_id\n\
+                 - Query RUM resources with that view_id → find slow API endpoints with trace_ids\n\
+                 - Fetch trace spans by trace_id OR service+resource_name → analyze parallelism and SQL\n\n\
+                 == Datadog Spans API (Performance Deep Dive) ==\n\
+                 - datadog_fetch_trace_spans: Fetch spans using Spans API v2 (NOT Traces API)\n\
+                   • With trace_id: trace_id=\"abc123\" (from RUM resources)\n\
+                   • Without trace_id: service=\"backend\" + resource_name=\"GET /portfolio/v1/fungibles/balances\"\n\
+                   • Returns: span hierarchy, parallelism analysis, SQL queries, timing waterfall\n\n\
+                 == Datadog APM & Logs ==\n\
+                 - datadog_query_apm_metrics: Performance metrics (p95, avg latency)\n\
+                 - datadog_query_apm_traces: Get trace query URL for Datadog UI\n\
+                 - datadog_query_logs: Search logs for errors and events\n\n\
+                 Most Datadog tools return URLs to the Datadog UI. datadog_fetch_trace_spans returns actual data."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -453,71 +635,8 @@ impl ServerHandler for RoxyMcpServer {
     }
 }
 
-// Import Datadog client
-use crate::datadog::{DatadogClient, QueryApmMetricsParams, QueryApmTracesParams, QueryLogsParams};
-
-// Extend RoxyMcpServer to optionally include Datadog client
-impl RoxyMcpServer {
-    /// Create a new MCP server instance with optional Datadog integration
-    pub async fn new_with_datadog() -> Result<Self> {
-        let config = ClickHouseConfig::default();
-        let clickhouse = RoxyClickHouse::new(config);
-
-        Ok(Self {
-            clickhouse: Arc::new(clickhouse),
-        })
-    }
-}
-
-/// Datadog integration tools (requires DD_API_KEY and DD_APP_KEY env vars)
-#[derive(Clone)]
-pub struct DatadogTools {
-    client: DatadogClient,
-}
-
-impl DatadogTools {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            client: DatadogClient::new()?,
-        })
-    }
-}
-
-#[tool(tool_box)]
-impl DatadogTools {
-    /// Query Datadog APM metrics
-    #[tool(
-        name = "datadog_query_apm_metrics",
-        description = "Query Datadog APM metrics for a service. Returns performance metrics like average duration, p95, p99."
-    )]
-    async fn query_apm_metrics(
-        &self,
-        #[tool(aggr)] params: QueryApmMetricsParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
-        self.client.query_apm_metrics(params).await
-    }
-
-    /// Query Datadog APM traces
-    #[tool(
-        name = "datadog_query_apm_traces",
-        description = "Query Datadog APM traces to find slow requests."
-    )]
-    async fn query_apm_traces(
-        &self,
-        #[tool(aggr)] params: QueryApmTracesParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
-        self.client.query_apm_traces(params).await
-    }
-
-    /// Query Datadog logs
-    #[tool(
-        name = "datadog_query_logs",
-        description = "Query Datadog logs for errors and events."
-    )]
-    async fn query_logs(
-        &self,
-        #[tool(aggr)] params: QueryLogsParams,
-    ) -> Result<CallToolResult, rmcp::Error> {
-        self.client.query_logs(params).await
-    }
-}
+// Import Datadog types for the tool parameters
+use crate::datadog::{
+    FetchTraceSpansParams, QueryApmMetricsParams, QueryApmTracesParams, QueryLogsParams,
+    QueryRumResourcesParams, QueryRumSessionsParams, QueryRumViewsParams,
+};

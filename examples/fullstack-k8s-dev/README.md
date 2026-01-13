@@ -59,3 +59,30 @@ Port forwards appear as dotted lines from "Roxy" to services in the traffic flow
 3. Select a namespace or "All Namespaces"
 4. View the traffic flow: Internet → Gateway → HTTPRoute → Service
 5. Port forwards from config appear as Roxy → Service (dotted lines)
+
+## Integration Tests
+
+This example includes comprehensive integration tests that validate the complete workflow:
+
+- Building and deploying to Kubernetes
+- Starting Roxy with system proxy enabled
+- Capturing HTTP requests in ClickHouse
+- Simulating React Native app requests
+
+### Quick Test
+
+```sh
+./run-integration-test.sh
+```
+
+### Manual Test
+
+```sh
+# Full integration test (requires ClickHouse)
+cargo test --test integration_test fullstack_k8s_integration_test -- --ignored --nocapture
+
+# Deployment only test
+cargo test --test integration_test test_k8s_deployment_only -- --ignored --nocapture
+```
+
+See [tests/README.md](tests/README.md) for detailed documentation.

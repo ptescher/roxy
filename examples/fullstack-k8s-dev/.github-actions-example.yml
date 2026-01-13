@@ -1,0 +1,154 @@
+# Example GitHub Actions workflow for running the integration test
+# Place this in .github/workflows/integration-test.yml
+
+name: Full-Stack K8s Integration Test
+
+on:
+  push:
+    paths:
+      - 'examples/fullstack-k8s-dev/**'
+      - 'crates/roxy-core/**'
+      - 'crates/roxy-proxy/**'
+  pull_request:
+    paths:
+      - 'examples/fullstack-k8s-dev/**'
+      - 'crates/roxy-core/**'
+      - 'crates/roxy-proxy/**'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration-test:
+    name: Full-Stack Integration Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache Cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Setup kind (Kubernetes in Docker)
+        uses: engineerd/setup-kind@v0.5.0
+        with:
+          version: v0.20.0
+          config: |
+            kind: Cluster
+            apiVersion: kind.x-k8s.io/v1alpha4
+            nodes:
+              - role: control-plane
+              - role: worker
+
+      - name: Install Gateway API CRDs
+        run: |
+          kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+          kubectl wait --for=condition=established --timeout=60s crd/gateways.gateway.networking.k8s.io
+
+      - name: Start ClickHouse
+        run: |
+          docker run -d \
+            --name roxy-clickhouse \
+            --network kind \
+            -p 8123:8123 \
+            -p 9000:9000 \
+            clickhouse/clickhouse-server:latest
+
+          # Wait for ClickHouse to be ready
+          echo "Waiting for ClickHouse..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8123/ping > /dev/null 2>&1; then
+              echo "ClickHouse is ready"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Build Roxy
+        run: cargo build --release --bin roxy
+
+      - name: Run Integration Test
+        working-directory: examples/fullstack-k8s-dev
+        run: |
+          cargo test --test integration_test fullstack_k8s_integration_test -- --ignored --nocapture
+        timeout-minutes: 10
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== Kubernetes Pods ==="
+          kubectl get pods -A
+
+          echo "=== Pod Descriptions ==="
+          kubectl describe pods -A
+
+          echo "=== Pod Logs ==="
+          for ns in backend database messaging gateway-system; do
+            echo "--- Namespace: $ns ---"
+            kubectl logs -n $ns --all-containers=true --tail=100 || true
+          done
+
+          echo "=== Docker Containers ==="
+          docker ps -a
+
+          echo "=== ClickHouse Logs ==="
+          docker logs roxy-clickhouse --tail=100 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kubectl delete -k examples/fullstack-k8s-dev/kubernetes/ || true
+          docker stop roxy-clickhouse || true
+          docker rm roxy-clickhouse || true
+
+  deployment-test:
+    name: Deployment Only Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Setup kind
+        uses: engineerd/setup-kind@v0.5.0
+
+      - name: Install Gateway API CRDs
+        run: |
+          kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+
+      - name: Run Deployment Test
+        working-directory: examples/fullstack-k8s-dev
+        run: |
+          cargo test --test integration_test test_k8s_deployment_only -- --ignored --nocapture
+        timeout-minutes: 5
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kubectl delete -k examples/fullstack-k8s-dev/kubernetes/ || true

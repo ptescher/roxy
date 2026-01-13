@@ -149,6 +149,27 @@ impl RoxyClickHouse {
             .await
             .context("Failed to create tcp_connections table")?;
 
+        // Create Datadog spans table for storing spans fetched from Datadog API
+        self.client
+            .query(DATADOG_SPANS_TABLE_SCHEMA)
+            .execute()
+            .await
+            .context("Failed to create datadog_spans table")?;
+
+        // Create Datadog RUM views table
+        self.client
+            .query(DATADOG_RUM_VIEWS_TABLE_SCHEMA)
+            .execute()
+            .await
+            .context("Failed to create datadog_rum_views table")?;
+
+        // Create Datadog RUM resources table
+        self.client
+            .query(DATADOG_RUM_RESOURCES_TABLE_SCHEMA)
+            .execute()
+            .await
+            .context("Failed to create datadog_rum_resources table")?;
+
         tracing::info!("ClickHouse schema initialized successfully");
         Ok(())
     }
@@ -688,6 +709,356 @@ impl RoxyClickHouse {
             .await?;
         Ok(connections)
     }
+
+    /// Search for traces by service and resource name pattern
+    ///
+    /// Returns trace IDs matching the criteria, ordered by most recent
+    pub async fn search_traces(
+        &self,
+        service_name: &str,
+        resource_pattern: Option<&str>,
+        min_duration_ns: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<String>> {
+        let mut query = "SELECT DISTINCT trace_id FROM spans WHERE service_name = ?".to_string();
+
+        if resource_pattern.is_some() {
+            query.push_str(" AND name LIKE ?");
+        }
+
+        if min_duration_ns.is_some() {
+            query.push_str(" AND duration_ns >= ?");
+        }
+
+        query.push_str(" ORDER BY start_time DESC LIMIT ?");
+
+        let mut q = self.client.query(&query).bind(service_name);
+
+        if let Some(pattern) = resource_pattern {
+            let like_pattern = format!("%{}%", pattern);
+            q = q.bind(like_pattern);
+        }
+
+        if let Some(min_dur) = min_duration_ns {
+            q = q.bind(min_dur);
+        }
+
+        q = q.bind(limit);
+
+        #[derive(Row, Deserialize)]
+        struct TraceIdRow {
+            trace_id: String,
+        }
+
+        let rows: Vec<TraceIdRow> = q.fetch_all().await?;
+        Ok(rows.into_iter().map(|r| r.trace_id).collect())
+    }
+
+    /// Get spans for a trace with timing analysis
+    ///
+    /// Returns spans ordered by start time, suitable for waterfall visualization
+    pub async fn get_trace_with_analysis(&self, trace_id: &str) -> Result<Vec<SpanRecord>> {
+        let spans = self
+            .client
+            .query("SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time ASC, parent_span_id ASC")
+            .bind(trace_id)
+            .fetch_all::<SpanRecord>()
+            .await?;
+        Ok(spans)
+    }
+
+    /// Search for database query spans
+    ///
+    /// Returns spans that contain SQL queries (identified by db.* attributes)
+    pub async fn search_database_spans(
+        &self,
+        service_name: Option<&str>,
+        min_duration_ns: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<SpanRecord>> {
+        let mut query = "SELECT * FROM spans WHERE (name LIKE '%query%' OR name LIKE '%sql%' OR attributes LIKE '%db.statement%')".to_string();
+
+        if service_name.is_some() {
+            query.push_str(" AND service_name = ?");
+        }
+
+        if min_duration_ns.is_some() {
+            query.push_str(" AND duration_ns >= ?");
+        }
+
+        query.push_str(" ORDER BY duration_ns DESC LIMIT ?");
+
+        let mut q = self.client.query(&query);
+
+        if let Some(service) = service_name {
+            q = q.bind(service);
+        }
+
+        if let Some(min_dur) = min_duration_ns {
+            q = q.bind(min_dur);
+        }
+
+        q = q.bind(limit);
+
+        let spans = q.fetch_all::<SpanRecord>().await?;
+        Ok(spans)
+    }
+
+    /// Insert a Datadog span record
+    pub async fn insert_datadog_span(&self, span: &DatadogSpanRecord) -> Result<()> {
+        let query = format!(
+            r"INSERT INTO datadog_spans (
+                id, trace_id, span_id, parent_id, fetched_at, query_params,
+                service, resource_name, operation_name, start_ns, duration_ns,
+                status, error, span_type, tags, meta, metrics, raw_span_json
+            ) VALUES (
+                '{id}', '{trace_id}', '{span_id}', '{parent_id}', {fetched_at}, '{query_params}',
+                '{service}', '{resource_name}', '{operation_name}', {start_ns}, {duration_ns},
+                '{status}', {error}, '{span_type}', '{tags}', '{meta}', '{metrics}', '{raw_span_json}'
+            )",
+            id = span.id,
+            trace_id = escape_string(&span.trace_id),
+            span_id = escape_string(&span.span_id),
+            parent_id = escape_string(&span.parent_id),
+            fetched_at = span.fetched_at,
+            query_params = escape_string(&span.query_params),
+            service = escape_string(&span.service),
+            resource_name = escape_string(&span.resource_name),
+            operation_name = escape_string(&span.operation_name),
+            start_ns = span.start_ns,
+            duration_ns = span.duration_ns,
+            status = escape_string(&span.status),
+            error = span.error,
+            span_type = escape_string(&span.span_type),
+            tags = escape_string(&span.tags),
+            meta = escape_string(&span.meta),
+            metrics = escape_string(&span.metrics),
+            raw_span_json = escape_string(&span.raw_span_json),
+        );
+
+        self.client
+            .query(&query)
+            .execute()
+            .await
+            .context("Failed to insert Datadog span")?;
+
+        Ok(())
+    }
+
+    /// Insert multiple Datadog span records
+    pub async fn insert_datadog_spans(&self, spans: &[DatadogSpanRecord]) -> Result<()> {
+        for span in spans {
+            self.insert_datadog_span(span).await?;
+        }
+        Ok(())
+    }
+
+    /// Query recent Datadog spans
+    pub async fn get_recent_datadog_spans(&self, limit: u32) -> Result<Vec<DatadogSpanRecord>> {
+        let spans = self
+            .client
+            .query("SELECT * FROM datadog_spans ORDER BY fetched_at DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all::<DatadogSpanRecord>()
+            .await?;
+        Ok(spans)
+    }
+
+    /// Query Datadog spans by trace ID
+    pub async fn get_datadog_spans_by_trace(
+        &self,
+        trace_id: &str,
+    ) -> Result<Vec<DatadogSpanRecord>> {
+        let spans = self
+            .client
+            .query("SELECT * FROM datadog_spans WHERE trace_id = ? ORDER BY start_ns ASC")
+            .bind(trace_id)
+            .fetch_all::<DatadogSpanRecord>()
+            .await?;
+        Ok(spans)
+    }
+
+    /// Query Datadog spans by service
+    pub async fn get_datadog_spans_by_service(
+        &self,
+        service: &str,
+        limit: u32,
+    ) -> Result<Vec<DatadogSpanRecord>> {
+        let spans = self
+            .client
+            .query("SELECT * FROM datadog_spans WHERE service = ? ORDER BY start_ns DESC LIMIT ?")
+            .bind(service)
+            .bind(limit)
+            .fetch_all::<DatadogSpanRecord>()
+            .await?;
+        Ok(spans)
+    }
+
+    /// Insert a Datadog RUM view record
+    pub async fn insert_datadog_rum_view(&self, view: &DatadogRumViewRecord) -> Result<()> {
+        let query = format!(
+            r"INSERT INTO datadog_rum_views (
+                id, view_id, session_id, application_id, fetched_at, timestamp,
+                view_name, view_url, duration_ms, loading_time_ms, error_count,
+                resource_count, action_count, long_task_count, user_id, user_email,
+                user_name, device_type, os_name, os_version, browser_name,
+                browser_version, country, city, raw_view_json
+            ) VALUES (
+                '{id}', '{view_id}', '{session_id}', '{application_id}', {fetched_at}, {timestamp},
+                '{view_name}', '{view_url}', {duration_ms}, {loading_time_ms}, {error_count},
+                {resource_count}, {action_count}, {long_task_count}, '{user_id}', '{user_email}',
+                '{user_name}', '{device_type}', '{os_name}', '{os_version}', '{browser_name}',
+                '{browser_version}', '{country}', '{city}', '{raw_view_json}'
+            )",
+            id = view.id,
+            view_id = escape_string(&view.view_id),
+            session_id = escape_string(&view.session_id),
+            application_id = escape_string(&view.application_id),
+            fetched_at = view.fetched_at,
+            timestamp = view.timestamp,
+            view_name = escape_string(&view.view_name),
+            view_url = escape_string(&view.view_url),
+            duration_ms = view.duration_ms,
+            loading_time_ms = view.loading_time_ms,
+            error_count = view.error_count,
+            resource_count = view.resource_count,
+            action_count = view.action_count,
+            long_task_count = view.long_task_count,
+            user_id = escape_string(&view.user_id),
+            user_email = escape_string(&view.user_email),
+            user_name = escape_string(&view.user_name),
+            device_type = escape_string(&view.device_type),
+            os_name = escape_string(&view.os_name),
+            os_version = escape_string(&view.os_version),
+            browser_name = escape_string(&view.browser_name),
+            browser_version = escape_string(&view.browser_version),
+            country = escape_string(&view.country),
+            city = escape_string(&view.city),
+            raw_view_json = escape_string(&view.raw_view_json),
+        );
+
+        self.client
+            .query(&query)
+            .execute()
+            .await
+            .context("Failed to insert Datadog RUM view")?;
+
+        Ok(())
+    }
+
+    /// Insert multiple Datadog RUM view records
+    pub async fn insert_datadog_rum_views(&self, views: &[DatadogRumViewRecord]) -> Result<()> {
+        for view in views {
+            self.insert_datadog_rum_view(view).await?;
+        }
+        Ok(())
+    }
+
+    /// Insert a Datadog RUM resource record
+    pub async fn insert_datadog_rum_resource(
+        &self,
+        resource: &DatadogRumResourceRecord,
+    ) -> Result<()> {
+        let query = format!(
+            r"INSERT INTO datadog_rum_resources (
+                id, resource_id, view_id, session_id, application_id, fetched_at, timestamp,
+                resource_url, resource_type, method, status_code, duration_ms, size_bytes,
+                trace_id, span_id, dns_duration_ms, connect_duration_ms, ssl_duration_ms,
+                download_duration_ms, first_byte_duration_ms, provider_name, provider_type,
+                raw_resource_json
+            ) VALUES (
+                '{id}', '{resource_id}', '{view_id}', '{session_id}', '{application_id}',
+                {fetched_at}, {timestamp}, '{resource_url}', '{resource_type}', '{method}',
+                {status_code}, {duration_ms}, {size_bytes}, '{trace_id}', '{span_id}',
+                {dns_duration_ms}, {connect_duration_ms}, {ssl_duration_ms}, {download_duration_ms},
+                {first_byte_duration_ms}, '{provider_name}', '{provider_type}', '{raw_resource_json}'
+            )",
+            id = resource.id,
+            resource_id = escape_string(&resource.resource_id),
+            view_id = escape_string(&resource.view_id),
+            session_id = escape_string(&resource.session_id),
+            application_id = escape_string(&resource.application_id),
+            fetched_at = resource.fetched_at,
+            timestamp = resource.timestamp,
+            resource_url = escape_string(&resource.resource_url),
+            resource_type = escape_string(&resource.resource_type),
+            method = escape_string(&resource.method),
+            status_code = resource.status_code,
+            duration_ms = resource.duration_ms,
+            size_bytes = resource.size_bytes,
+            trace_id = escape_string(&resource.trace_id),
+            span_id = escape_string(&resource.span_id),
+            dns_duration_ms = resource.dns_duration_ms,
+            connect_duration_ms = resource.connect_duration_ms,
+            ssl_duration_ms = resource.ssl_duration_ms,
+            download_duration_ms = resource.download_duration_ms,
+            first_byte_duration_ms = resource.first_byte_duration_ms,
+            provider_name = escape_string(&resource.provider_name),
+            provider_type = escape_string(&resource.provider_type),
+            raw_resource_json = escape_string(&resource.raw_resource_json),
+        );
+
+        self.client
+            .query(&query)
+            .execute()
+            .await
+            .context("Failed to insert Datadog RUM resource")?;
+
+        Ok(())
+    }
+
+    /// Insert multiple Datadog RUM resource records
+    pub async fn insert_datadog_rum_resources(
+        &self,
+        resources: &[DatadogRumResourceRecord],
+    ) -> Result<()> {
+        for resource in resources {
+            self.insert_datadog_rum_resource(resource).await?;
+        }
+        Ok(())
+    }
+
+    /// Query recent Datadog RUM views
+    pub async fn get_recent_datadog_rum_views(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<DatadogRumViewRecord>> {
+        let views = self
+            .client
+            .query("SELECT * FROM datadog_rum_views ORDER BY timestamp DESC, view_name ASC, id ASC LIMIT ?")
+            .bind(limit)
+            .fetch_all::<DatadogRumViewRecord>()
+            .await?;
+        Ok(views)
+    }
+
+    /// Query recent Datadog RUM resources
+    pub async fn get_recent_datadog_rum_resources(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<DatadogRumResourceRecord>> {
+        let resources = self
+            .client
+            .query("SELECT * FROM datadog_rum_resources ORDER BY timestamp DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all::<DatadogRumResourceRecord>()
+            .await?;
+        Ok(resources)
+    }
+
+    /// Query Datadog RUM resources by view ID
+    pub async fn get_datadog_rum_resources_by_view(
+        &self,
+        view_id: &str,
+    ) -> Result<Vec<DatadogRumResourceRecord>> {
+        let resources = self
+            .client
+            .query("SELECT * FROM datadog_rum_resources WHERE view_id = ? ORDER BY timestamp ASC")
+            .bind(view_id)
+            .fetch_all::<DatadogRumResourceRecord>()
+            .await?;
+        Ok(resources)
+    }
 }
 
 /// Active Kubernetes service connection summary
@@ -854,6 +1225,154 @@ pub struct KafkaMessageRow {
     pub error_code: i16,
     pub error_message: String,
     pub attributes: String,
+}
+
+/// Datadog span record stored in ClickHouse
+/// Stores spans fetched from Datadog API for local analysis
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Row)]
+pub struct DatadogSpanRecord {
+    /// Unique identifier for this record
+    pub id: String,
+    /// Trace ID
+    pub trace_id: String,
+    /// Span ID
+    pub span_id: String,
+    /// Parent span ID
+    pub parent_id: String,
+    /// When this span was fetched from Datadog (milliseconds since epoch)
+    pub fetched_at: i64,
+    /// Query parameters used to fetch this span (JSON encoded)
+    pub query_params: String,
+    /// Service name
+    pub service: String,
+    /// Resource name (e.g., "GET /api/endpoint")
+    pub resource_name: String,
+    /// Operation name (e.g., "http.request")
+    pub operation_name: String,
+    /// Span start time (nanoseconds since epoch)
+    pub start_ns: i64,
+    /// Span duration in nanoseconds
+    pub duration_ns: i64,
+    /// Span status (e.g., "ok", "error")
+    pub status: String,
+    /// Error flag (1 if span has error, 0 otherwise)
+    pub error: u8,
+    /// Span type (e.g., "web", "db", "cache")
+    pub span_type: String,
+    /// Tags as JSON string
+    pub tags: String,
+    /// Meta attributes as JSON string
+    pub meta: String,
+    /// Metrics as JSON string
+    pub metrics: String,
+    /// Raw span JSON from Datadog API
+    pub raw_span_json: String,
+}
+
+/// Datadog RUM view record stored in ClickHouse
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Row)]
+pub struct DatadogRumViewRecord {
+    /// Unique identifier for this record
+    pub id: String,
+    /// View ID
+    pub view_id: String,
+    /// Session ID
+    pub session_id: String,
+    /// Application ID
+    pub application_id: String,
+    /// When this view was fetched/captured (milliseconds since epoch)
+    pub fetched_at: i64,
+    /// View timestamp (milliseconds since epoch)
+    pub timestamp: i64,
+    /// View name
+    pub view_name: String,
+    /// View URL
+    pub view_url: String,
+    /// View duration in milliseconds
+    pub duration_ms: f64,
+    /// Loading time in milliseconds
+    pub loading_time_ms: f64,
+    /// Number of errors in view
+    pub error_count: i64,
+    /// Number of resources loaded
+    pub resource_count: i64,
+    /// Number of user actions
+    pub action_count: i64,
+    /// Number of long tasks
+    pub long_task_count: i64,
+    /// User ID
+    pub user_id: String,
+    /// User email
+    pub user_email: String,
+    /// User name
+    pub user_name: String,
+    /// Device type (mobile, tablet, desktop)
+    pub device_type: String,
+    /// OS name
+    pub os_name: String,
+    /// OS version
+    pub os_version: String,
+    /// Browser name
+    pub browser_name: String,
+    /// Browser version
+    pub browser_version: String,
+    /// Country
+    pub country: String,
+    /// City
+    pub city: String,
+    /// Raw view JSON
+    pub raw_view_json: String,
+}
+
+/// Datadog RUM resource record stored in ClickHouse
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Row)]
+pub struct DatadogRumResourceRecord {
+    /// Unique identifier for this record
+    pub id: String,
+    /// Resource ID (generated or from Datadog)
+    pub resource_id: String,
+    /// View ID this resource belongs to
+    pub view_id: String,
+    /// Session ID
+    pub session_id: String,
+    /// Application ID
+    pub application_id: String,
+    /// When this resource was fetched/captured (milliseconds since epoch)
+    pub fetched_at: i64,
+    /// Resource timestamp (milliseconds since epoch)
+    pub timestamp: i64,
+    /// Resource URL
+    pub resource_url: String,
+    /// Resource type (xhr, fetch, image, etc.)
+    pub resource_type: String,
+    /// HTTP method
+    pub method: String,
+    /// HTTP status code
+    pub status_code: i64,
+    /// Resource duration in milliseconds
+    pub duration_ms: f64,
+    /// Resource size in bytes
+    pub size_bytes: i64,
+    /// Trace ID if available
+    pub trace_id: String,
+    /// Span ID if available
+    pub span_id: String,
+    /// DNS duration
+    pub dns_duration_ms: f64,
+    /// Connect duration
+    pub connect_duration_ms: f64,
+    /// SSL duration
+    pub ssl_duration_ms: f64,
+    /// Download duration
+    pub download_duration_ms: f64,
+    /// Time to first byte
+    pub first_byte_duration_ms: f64,
+    /// Provider name (if applicable)
+    pub provider_name: String,
+    /// Provider type (if applicable)
+    pub provider_type: String,
+    /// Raw resource JSON
+    pub raw_resource_json: String,
 }
 
 /// TCP connection record for raw packet tracking
@@ -1179,6 +1698,110 @@ CREATE TABLE IF NOT EXISTS tcp_connections (
 ORDER BY (protocol, timestamp, id)
 PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(timestamp))
 TTL fromUnixTimestamp64Milli(timestamp) + INTERVAL 7 DAY
+";
+
+const DATADOG_SPANS_TABLE_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS datadog_spans (
+    id String,
+    trace_id String,
+    span_id String,
+    parent_id String,
+    fetched_at Int64,
+    query_params String,
+    service String,
+    resource_name String,
+    operation_name String,
+    start_ns Int64,
+    duration_ns Int64,
+    status String,
+    error UInt8,
+    span_type String,
+    tags String,
+    meta String,
+    metrics String,
+    raw_span_json String,
+    INDEX idx_trace_id trace_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_service service TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_resource resource_name TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_operation operation_name TYPE bloom_filter GRANULARITY 1
+) ENGINE = MergeTree()
+ORDER BY (service, start_ns, trace_id, span_id)
+PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(fetched_at))
+TTL fromUnixTimestamp64Milli(fetched_at) + INTERVAL 30 DAY
+";
+
+const DATADOG_RUM_VIEWS_TABLE_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS datadog_rum_views (
+    id String,
+    view_id String,
+    session_id String,
+    application_id String,
+    fetched_at Int64,
+    timestamp Int64,
+    view_name String,
+    view_url String,
+    duration_ms Float64,
+    loading_time_ms Float64,
+    error_count Int64,
+    resource_count Int64,
+    action_count Int64,
+    long_task_count Int64,
+    user_id String,
+    user_email String,
+    user_name String,
+    device_type String,
+    os_name String,
+    os_version String,
+    browser_name String,
+    browser_version String,
+    country String,
+    city String,
+    raw_view_json String,
+    INDEX idx_view_id view_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_application_id application_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_view_name view_name TYPE bloom_filter GRANULARITY 1
+) ENGINE = MergeTree()
+ORDER BY (application_id, timestamp, view_id)
+PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(timestamp))
+TTL fromUnixTimestamp64Milli(fetched_at) + INTERVAL 30 DAY
+";
+
+const DATADOG_RUM_RESOURCES_TABLE_SCHEMA: &str = r"
+CREATE TABLE IF NOT EXISTS datadog_rum_resources (
+    id String,
+    resource_id String,
+    view_id String,
+    session_id String,
+    application_id String,
+    fetched_at Int64,
+    timestamp Int64,
+    resource_url String,
+    resource_type String,
+    method String,
+    status_code Int64,
+    duration_ms Float64,
+    size_bytes Int64,
+    trace_id String,
+    span_id String,
+    dns_duration_ms Float64,
+    connect_duration_ms Float64,
+    ssl_duration_ms Float64,
+    download_duration_ms Float64,
+    first_byte_duration_ms Float64,
+    provider_name String,
+    provider_type String,
+    raw_resource_json String,
+    INDEX idx_resource_id resource_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_view_id view_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_session_id session_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_application_id application_id TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_resource_url resource_url TYPE bloom_filter GRANULARITY 1,
+    INDEX idx_trace_id trace_id TYPE bloom_filter GRANULARITY 1
+) ENGINE = MergeTree()
+ORDER BY (application_id, timestamp, resource_id)
+PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(timestamp))
+TTL fromUnixTimestamp64Milli(fetched_at) + INTERVAL 30 DAY
 ";
 
 #[cfg(test)]

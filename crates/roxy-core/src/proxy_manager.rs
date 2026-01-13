@@ -4,6 +4,7 @@
 //! the roxy-proxy backend process.
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -14,6 +15,25 @@ use tracing::{error, info, warn};
 
 /// Default proxy port
 pub const DEFAULT_PROXY_PORT: u16 = 8080;
+
+/// Control command for the proxy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum ControlCommand {
+    /// Enable or disable auto port-forwarding
+    SetAutoPortForward { enabled: bool },
+    /// Get current status
+    GetStatus,
+}
+
+/// Response from control API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlResponse {
+    pub success: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
 
 /// Status of the proxy process
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -437,6 +457,40 @@ impl ProxyManager {
     /// Get the proxy URL
     pub fn proxy_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.config.proxy_port)
+    }
+
+    /// Send a control command to the proxy
+    pub async fn send_control_command(&self, command: ControlCommand) -> Result<ControlResponse> {
+        let client = reqwest::Client::new();
+        let response = client
+            .post("http://127.0.0.1:8889/control")
+            .json(&command)
+            .send()
+            .await
+            .context("Failed to send control command")?;
+
+        if !response.status().is_success() {
+            bail!("Control command failed with status: {}", response.status());
+        }
+
+        let result: ControlResponse = response
+            .json()
+            .await
+            .context("Failed to parse control response")?;
+
+        if !result.success {
+            bail!("Control command failed: {}", result.message);
+        }
+
+        Ok(result)
+    }
+
+    /// Set auto port-forwarding enabled/disabled
+    pub async fn set_auto_port_forward(&self, enabled: bool) -> Result<()> {
+        let command = ControlCommand::SetAutoPortForward { enabled };
+        self.send_control_command(command).await?;
+        info!("Auto port-forward set to: {}", enabled);
+        Ok(())
     }
 }
 
