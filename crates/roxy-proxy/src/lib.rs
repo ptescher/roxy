@@ -1445,10 +1445,15 @@ fn parse_rum_resource_event(
 pub mod system_proxy {
     use anyhow::{Context, Result};
     use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tracing::info;
 
     /// Hosts to bypass when using the proxy (localhost, local addresses)
     const BYPASS_HOSTS: &str = "localhost, 127.0.0.1, ::1, *.local";
+
+    /// Global flag to track if system proxy is currently enabled
+    /// This ensures we only try to clear it if we set it
+    static SYSTEM_PROXY_ENABLED: AtomicBool = AtomicBool::new(false);
 
     /// Set the system HTTP proxy
     pub fn set_system_proxy(port: u16) -> Result<()> {
@@ -1508,6 +1513,9 @@ pub mod system_proxy {
             .output()
             .context("Failed to set proxy bypass domains")?;
 
+        // Mark that we have enabled the system proxy
+        SYSTEM_PROXY_ENABLED.store(true, Ordering::SeqCst);
+
         info!(
             port = port,
             bypass = BYPASS_HOSTS,
@@ -1518,6 +1526,11 @@ pub mod system_proxy {
 
     /// Clear the system proxy settings
     pub fn clear_system_proxy() -> Result<()> {
+        // Only clear if we previously set the proxy
+        if !SYSTEM_PROXY_ENABLED.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
+
         let output = Command::new("networksetup")
             .args(["-listallnetworkservices"])
             .output()
@@ -1553,6 +1566,11 @@ pub mod system_proxy {
         info!("System proxy cleared");
         Ok(())
     }
+
+    /// Check if system proxy is currently enabled by this process
+    pub fn is_system_proxy_enabled() -> bool {
+        SYSTEM_PROXY_ENABLED.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1566,6 +1584,53 @@ pub mod system_proxy {
 
     pub fn clear_system_proxy() -> Result<()> {
         Ok(())
+    }
+
+    pub fn is_system_proxy_enabled() -> bool {
+        false
+    }
+}
+
+/// Guard that ensures system proxy is cleared when dropped.
+///
+/// This provides a safety net for cleanup even if the process is terminated
+/// unexpectedly. On SIGTERM, the Drop will be called as part of normal
+/// Rust stack unwinding.
+pub struct SystemProxyGuard {
+    /// Whether this guard should clear the proxy on drop
+    active: bool,
+}
+
+impl SystemProxyGuard {
+    /// Create a new guard. If `configure` is true, sets the system proxy.
+    pub fn new(port: u16, configure: bool) -> Self {
+        if configure {
+            if let Err(e) = system_proxy::set_system_proxy(port) {
+                warn!("Failed to configure system proxy: {}", e);
+            }
+        }
+        Self { active: configure }
+    }
+
+    /// Manually clear the proxy and deactivate the guard
+    pub fn clear(&mut self) {
+        if self.active {
+            if let Err(e) = system_proxy::clear_system_proxy() {
+                warn!("Failed to clear system proxy: {}", e);
+            }
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for SystemProxyGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // Log at a lower level since this might be during shutdown
+            if let Err(e) = system_proxy::clear_system_proxy() {
+                eprintln!("Failed to clear system proxy on drop: {}", e);
+            }
+        }
     }
 }
 
@@ -1709,6 +1774,20 @@ impl ProxyServer {
     }
 
     /// Run the proxy server
+    /// Run the proxy server
+    ///
+    /// This method runs until a shutdown signal (SIGINT or SIGTERM) is received.
+    /// On shutdown, it will:
+    /// 1. Stop accepting new connections
+    /// 2. Clear the system proxy settings (if configured)
+    /// 3. Stop all backend services
+    /// Run the proxy server
+    ///
+    /// This method runs until a shutdown signal (SIGINT or SIGTERM) is received.
+    /// On shutdown, it will:
+    /// 1. Stop accepting new connections
+    /// 2. Clear the system proxy settings (if configured)
+    /// 3. Stop all backend services
     pub async fn run(&mut self) -> Result<()> {
         self.running.store(true, Ordering::SeqCst);
 
@@ -1729,11 +1808,9 @@ impl ProxyServer {
             .await
             .context("Failed to bind to address")?;
 
-        if self.config.configure_system_proxy {
-            if let Err(e) = system_proxy::set_system_proxy(self.config.port) {
-                warn!("Failed to configure system proxy: {}", e);
-            }
-        }
+        // Create a system proxy guard that will clear the proxy on drop
+        // This ensures cleanup even if we exit unexpectedly
+        let mut _proxy_guard = SystemProxyGuard::new(self.config.port, self.config.configure_system_proxy);
 
         // Start SOCKS5 proxy in a separate task if enabled
         if let Some(socks) = &self.socks_proxy {
@@ -1790,36 +1867,120 @@ impl ProxyServer {
         }
         info!("=================================================");
 
+        // Run the main proxy loop with signal handling
+        let shutdown_reason = self.run_accept_loop(listener).await;
+        info!("Shutdown triggered: {}", shutdown_reason);
+
+        // Graceful shutdown
+        self.running.store(false, Ordering::SeqCst);
+        info!("Stopping proxy server...");
+
+        // Clear system proxy (guard will also try on drop, but explicit is better)
+        _proxy_guard.clear();
+
+        // Stop backend services
+        self.stop_services().await?;
+
+        info!("Proxy server stopped successfully");
+        Ok(())
+    }
+
+    /// Run the accept loop with proper signal handling
+    ///
+    /// Returns a string describing why shutdown was triggered.
+    async fn run_accept_loop(&self, listener: TcpListener) -> &'static str {
+        // Set up SIGTERM handler for Unix systems
+        #[cfg(unix)]
+        let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("Failed to register SIGTERM handler: {}", e);
+                None
+            }
+        };
+
         loop {
-            let (stream, client_addr) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    error!(error = %e, "Failed to accept connection");
-                    continue;
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    biased;
+
+                    // Handle Ctrl+C (SIGINT) - highest priority
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Received SIGINT, shutting down gracefully...");
+                        return "SIGINT";
+                    }
+
+                    // Handle SIGTERM
+                    _ = async {
+                        if let Some(ref mut s) = sigterm {
+                            s.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        info!("Received SIGTERM, shutting down gracefully...");
+                        return "SIGTERM";
+                    }
+
+                    // Handle incoming connections
+                    accept_result = listener.accept() => {
+                        self.handle_accepted_connection(accept_result).await;
+                    }
                 }
-            };
+            }
 
-            let io = TokioIo::new(stream);
-            let state = self.state.clone();
+            #[cfg(not(unix))]
+            {
+                tokio::select! {
+                    biased;
 
-            tokio::task::spawn(async move {
-                let service = service_fn(move |req| {
-                    let state = state.clone();
-                    async move { handle_request(req, client_addr, state).await }
-                });
+                    // Handle Ctrl+C (SIGINT)
+                    _ = tokio::signal::ctrl_c() => {
+                        info!("Received SIGINT, shutting down gracefully...");
+                        return "SIGINT";
+                    }
 
-                if let Err(err) = http1::Builder::new()
-                    .preserve_header_case(true)
-                    .title_case_headers(true)
-                    .serve_connection(io, service)
-                    .with_upgrades()
-                    .await
-                {
-                    debug!(error = %err, "Connection error");
+                    // Handle incoming connections
+                    accept_result = listener.accept() => {
+                        self.handle_accepted_connection(accept_result).await;
+                    }
                 }
-            });
+            }
         }
     }
+
+    /// Handle a single accepted connection
+    async fn handle_accepted_connection(&self, accept_result: std::io::Result<(TcpStream, SocketAddr)>) {
+        match accept_result {
+            Ok((stream, client_addr)) => {
+                let io = TokioIo::new(stream);
+                let state = self.state.clone();
+
+                tokio::task::spawn(async move {
+                    let service = service_fn(move |req| {
+                        let state = state.clone();
+                        async move { handle_request(req, client_addr, state).await }
+                    });
+
+                    if let Err(err) = http1::Builder::new()
+                        .preserve_header_case(true)
+                        .title_case_headers(true)
+                        .serve_connection(io, service)
+                        .with_upgrades()
+                        .await
+                    {
+                        debug!(error = %err, "Connection error");
+                    }
+                });
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to accept connection");
+            }
+        }
+    }
+
+
 
     /// Check if the proxy is currently running
     pub fn is_running(&self) -> bool {
@@ -1998,19 +2159,17 @@ impl ProxyServer {
     }
 }
 
-/// Convenience function to run a proxy with default configuration
+/// Convenience function to run a proxy with the given configuration.
+///
+/// This function handles:
+/// - Service startup (ClickHouse, OTel collector)
+/// - Signal handling (SIGINT/SIGTERM) for graceful shutdown
+/// - System proxy cleanup on exit
 pub async fn run_proxy(config: ProxyConfig) -> Result<()> {
     let mut server = ProxyServer::new(config).await?;
     server.setup_services().await?;
 
-    // Handle Ctrl+C gracefully
-    let running = server.running.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Shutting down...");
-        running.store(false, Ordering::SeqCst);
-    });
-
+    // run() now handles signals internally and performs cleanup
     server.run().await
 }
 
