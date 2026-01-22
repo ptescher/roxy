@@ -31,6 +31,7 @@ pub fn init_crypto_provider() {
     });
 }
 
+pub mod auth;
 pub mod control;
 pub mod gateway;
 pub mod kubectl;
@@ -39,6 +40,7 @@ pub mod protocol;
 pub mod socks;
 pub mod tls;
 
+pub use auth::{AuthConfig, AuthManager, AuthResult, HeaderMapping};
 pub use gateway::GatewayRouter;
 pub use kubectl::{K8sService, K8sStream, KubectlPortForwardManager};
 pub use process::{identify_process, ProcessInfo};
@@ -245,6 +247,8 @@ struct ProxyState {
     tls_manager: Option<Arc<TlsManager>>,
     /// Whether auto port-forwarding is enabled for HTTPRoute K8s services
     auto_port_forward_enabled: Arc<AtomicBool>,
+    /// Auth manager for JWT introspection and header injection
+    auth_manager: Arc<AuthManager>,
 }
 
 /// HTTP body type alias
@@ -319,6 +323,7 @@ async fn handle_connect(
             // Get TLS manager for interception
             let tls_manager = state.tls_manager.clone().unwrap();
             let clickhouse = state.clickhouse.clone();
+            let auth_manager = state.auth_manager.clone();
 
             // Spawn a task to handle the intercepted connection
             tokio::task::spawn(async move {
@@ -331,6 +336,7 @@ async fn handle_connect(
                             client_addr,
                             tls_manager,
                             clickhouse,
+                            auth_manager,
                         )
                         .await
                         {
@@ -417,7 +423,7 @@ async fn handle_connect(
 /// This performs:
 /// 1. TLS termination with a generated certificate for the client
 /// 2. TLS connection to the actual target server
-/// 3. HTTP request/response forwarding with logging
+/// 3. HTTP request/response forwarding with logging and auth header injection
 async fn handle_tls_intercept(
     upgraded: hyper::upgrade::Upgraded,
     host: &str,
@@ -425,6 +431,7 @@ async fn handle_tls_intercept(
     client_addr: SocketAddr,
     tls_manager: Arc<TlsManager>,
     clickhouse: RoxyClickHouse,
+    auth_manager: Arc<AuthManager>,
 ) -> anyhow::Result<()> {
     use tokio_rustls::TlsAcceptor;
 
@@ -457,16 +464,20 @@ async fn handle_tls_intercept(
     debug!(host = %host, "TLS handshake complete with target server");
 
     // Now we have decrypted streams on both sides - run HTTP proxy between them
-    run_https_proxy(tls_stream, target_tls, host, client_addr, clickhouse).await
+    run_https_proxy(tls_stream, target_tls, host, client_addr, clickhouse, auth_manager).await
 }
 
 /// Run HTTP proxy between decrypted TLS streams
+///
+/// This function proxies HTTP requests over decrypted TLS streams and injects
+/// auth headers when JWT authentication is configured.
 async fn run_https_proxy<C, S>(
     client_stream: C,
     server_stream: S,
     host: &str,
     client_addr: SocketAddr,
     clickhouse: RoxyClickHouse,
+    auth_manager: Arc<AuthManager>,
 ) -> anyhow::Result<()>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -483,7 +494,7 @@ where
     let host = host.to_string();
 
     // Simple bidirectional proxy with basic HTTP request/response logging
-    // For a full implementation, we would parse HTTP and log like handle_http_forward
+    // With auth header injection support
     loop {
         let mut request_line = String::new();
 
@@ -512,16 +523,55 @@ where
                 // Forward request line to server
                 server_write.write_all(request_line.as_bytes()).await?;
 
-                // Read and forward headers
+                // Read headers and build HeaderMap for auth processing
+                let mut header_map = http::HeaderMap::new();
+                let mut raw_headers = Vec::new();
+
                 loop {
                     let mut header_line = String::new();
                     client_reader.read_line(&mut header_line).await?;
-                    server_write.write_all(header_line.as_bytes()).await?;
 
                     if header_line.trim().is_empty() {
                         break;
                     }
+
+                    // Parse header for auth processing
+                    if let Some(colon_idx) = header_line.find(':') {
+                        let name = header_line[..colon_idx].trim().to_lowercase();
+                        let value = header_line[colon_idx + 1..].trim();
+                        if let Ok(header_name) = http::header::HeaderName::try_from(name.as_str()) {
+                            if let Ok(header_value) = http::header::HeaderValue::from_str(value) {
+                                header_map.insert(header_name, header_value);
+                            }
+                        }
+                    }
+
+                    raw_headers.push(header_line);
                 }
+
+                // Process auth and get headers to inject
+                let auth_result = auth_manager.process_request(&header_map).await;
+
+                // Forward original headers
+                for header_line in &raw_headers {
+                    server_write.write_all(header_line.as_bytes()).await?;
+                }
+
+                // Inject auth headers if we have them
+                if let Some(ref auth) = auth_result {
+                    for (header_name, header_value) in &auth.headers_to_inject {
+                        let injected_header = format!("{}: {}\r\n", header_name, header_value);
+                        server_write.write_all(injected_header.as_bytes()).await?;
+                        debug!(
+                            host = %host,
+                            header = %header_name,
+                            "Injected auth header"
+                        );
+                    }
+                }
+
+                // Write empty line to end headers
+                server_write.write_all(b"\r\n").await?;
                 server_write.flush().await?;
 
                 // Read response from server and forward to client
@@ -830,6 +880,14 @@ async fn handle_http_forward(
         }
     };
 
+    // Process JWT auth and get headers to inject (only for local backends)
+    let is_local_backend = connect_addr != target_addr;
+    let auth_result = if is_local_backend {
+        state.auth_manager.process_request(&parts.headers).await
+    } else {
+        None
+    };
+
     match TcpStream::connect(&connect_addr).await {
         Ok(stream) => {
             let io = TokioIo::new(stream);
@@ -868,6 +926,13 @@ async fn handle_http_forward(
             for (key, value) in parts.headers.iter() {
                 if key != "proxy-connection" {
                     target_req = target_req.header(key, value);
+                }
+            }
+
+            // Inject auth headers if we have them (only for local backends)
+            if let Some(ref auth) = auth_result {
+                for (header_name, header_value) in &auth.headers_to_inject {
+                    target_req = target_req.header(header_name.as_str(), header_value.as_str());
                 }
             }
 
@@ -1518,6 +1583,8 @@ pub struct ProxyServer {
     mcp_server: Option<SseMcpServer>,
     /// TLS manager for certificate generation (if TLS interception enabled)
     tls_manager: Option<Arc<TlsManager>>,
+    /// Auth manager for JWT introspection
+    auth_manager: Arc<AuthManager>,
 }
 
 impl ProxyServer {
@@ -1564,6 +1631,7 @@ impl ProxyServer {
             active_k8s_connections: active_k8s_connections.clone(),
             tls_manager,
             auto_port_forward_enabled: Arc::new(AtomicBool::new(true)), // Enabled by default
+            auth_manager: Arc::new(AuthManager::new()),
         });
 
         // Create SOCKS5 proxy if enabled, with ClickHouse for protocol interception
@@ -1581,6 +1649,7 @@ impl ProxyServer {
 
         // Clone tls_manager from state for the ProxyServer struct
         let tls_manager = state.tls_manager.clone();
+        let auth_manager = state.auth_manager.clone();
 
         Ok(Self {
             config,
@@ -1591,6 +1660,7 @@ impl ProxyServer {
             active_k8s_connections,
             mcp_server: None,
             tls_manager,
+            auth_manager,
         })
     }
 
@@ -1675,10 +1745,11 @@ impl ProxyServer {
             });
         }
 
-        // Start control API server (shares the same Arc<AtomicBool> with state)
-        let control_server = control::ControlServer::new(
+        // Start control API server (shares the same Arc<AtomicBool> and AuthManager with state)
+        let control_server = control::ControlServer::with_auth_manager(
             control::DEFAULT_CONTROL_PORT,
             self.state.auto_port_forward_enabled.clone(),
+            self.state.auth_manager.clone(),
         );
         tokio::spawn(async move {
             if let Err(e) = control_server.run().await {
@@ -1808,6 +1879,44 @@ impl ProxyServer {
     /// Get the TLS manager (if TLS interception is enabled)
     pub fn tls_manager(&self) -> Option<&Arc<TlsManager>> {
         self.tls_manager.as_ref()
+    }
+
+    /// Get the auth manager for JWT introspection
+    pub fn auth_manager(&self) -> &Arc<AuthManager> {
+        &self.auth_manager
+    }
+
+    /// Configure JWT authentication
+    ///
+    /// This enables JWT introspection and header injection for requests
+    /// forwarded to local backends.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// server.configure_auth(AuthConfig {
+    ///     jwks_url: "https://auth.example.com/.well-known/jwks.json".to_string(),
+    ///     issuer: "https://auth.example.com".to_string(),
+    ///     audience: Some("my-api".to_string()),
+    ///     header_mappings: vec![
+    ///         HeaderMapping { claim: "sub".to_string(), header: "X-User-ID".to_string() },
+    ///         HeaderMapping { claim: "email".to_string(), header: "X-User-Email".to_string() },
+    ///     ],
+    ///     enabled: true,
+    /// }).await;
+    /// ```
+    pub async fn configure_auth(&self, config: AuthConfig) {
+        self.auth_manager.configure(config).await;
+    }
+
+    /// Disable JWT authentication
+    pub async fn disable_auth(&self) {
+        self.auth_manager.disable().await;
+    }
+
+    /// Check if JWT authentication is enabled
+    pub async fn is_auth_enabled(&self) -> bool {
+        self.auth_manager.is_enabled().await
     }
 
     /// Add a host to the TLS interception list

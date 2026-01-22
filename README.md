@@ -646,6 +646,68 @@ For complete API documentation, see:
 - [OpenAPI Specification](crates/roxy-proxy/openapi.yaml)
 - [Test Script](crates/roxy-proxy/test_control_api.sh)
 
+### JWT Authentication and Header Injection
+
+In Kubernetes environments, sidecars like Istio or Oathkeeper typically perform JWT token introspection and inject headers (e.g., `X-User-ID`, `X-User-Email`) before requests reach backend services. When routing traffic to local backend instances via Roxy, this authentication layer is bypassed.
+
+Roxy can restore this functionality by:
+1. Extracting Bearer tokens from the `Authorization` header
+2. Validating JWTs using JWKS (JSON Web Key Set)
+3. Injecting configured claims as headers when forwarding to local backends
+
+**Configure via Control API:**
+
+```bash
+# Configure JWT authentication
+curl -X POST http://localhost:8889/auth/configure \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jwks_url": "https://auth.example.com/.well-known/jwks.json",
+    "issuer": "https://auth.example.com",
+    "audience": "my-api",
+    "header_mappings": [
+      { "claim": "sub", "header": "X-User-ID" },
+      { "claim": "email", "header": "X-User-Email" },
+      { "claim": "name", "header": "X-User-Name" }
+    ],
+    "enabled": true
+  }'
+
+# Get current auth configuration
+curl http://localhost:8889/auth/config
+
+# Disable JWT authentication
+curl -X DELETE http://localhost:8889/auth/configure
+```
+
+**Configuration Options:**
+
+| Field | Description | Required |
+|-------|-------------|----------|
+| `jwks_url` | URL to fetch JWKS keys from | Yes |
+| `issuer` | Expected token issuer (`iss` claim) | Yes |
+| `audience` | Expected token audience (`aud` claim) | No |
+| `header_mappings` | Array of claim-to-header mappings | No |
+| `enabled` | Whether to enable auth injection | No (default: true) |
+
+**Behavior:**
+
+- Headers are only injected when forwarding to **local backends** (port-forwards, routing rules)
+- If no Bearer token is present, the request is forwarded without auth headers
+- If token validation fails, the request is forwarded without auth headers (logged as warning)
+- JWKS keys are cached for 1 hour and refreshed automatically
+- Auth failures never block requests—this is for local dev convenience
+
+**Example Use Case:**
+
+Your production setup has an Istio sidecar that validates JWTs and injects:
+```
+X-User-ID: user-123
+X-User-Email: user@example.com
+```
+
+With Roxy's JWT auth configured, your local backend receives the same headers when you make authenticated requests through the proxy.
+
 ### Running Proxy Standalone
 
 If you want to run just the proxy (e.g., on Linux without the UI):

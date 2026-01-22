@@ -1,8 +1,19 @@
 //! Control API for runtime configuration
 //!
 //! This module provides a simple HTTP API for controlling the proxy
-//! at runtime, such as enabling/disabling features.
+//! at runtime, such as enabling/disabling features and configuring
+//! JWT authentication.
+//!
+//! ## Endpoints
+//!
+//! - `GET /health` - Health check
+//! - `GET /status` - Get current proxy status
+//! - `POST /control` - Send control commands
+//! - `POST /auth/configure` - Configure JWT authentication
+//! - `GET /auth/config` - Get current auth configuration
+//! - `DELETE /auth/configure` - Disable JWT authentication
 
+use crate::auth::{AuthConfig, AuthManager};
 use http_body_util::BodyExt;
 use hyper::{
     body::Incoming, server::conn::http1, service::service_fn, Method, Request, Response, StatusCode,
@@ -67,6 +78,7 @@ impl ControlResponse {
 pub struct ControlServer {
     port: u16,
     auto_port_forward_enabled: Arc<AtomicBool>,
+    auth_manager: Arc<AuthManager>,
 }
 
 impl ControlServer {
@@ -75,7 +87,26 @@ impl ControlServer {
         Self {
             port,
             auto_port_forward_enabled,
+            auth_manager: Arc::new(AuthManager::new()),
         }
+    }
+
+    /// Create a new control server with a shared auth manager
+    pub fn with_auth_manager(
+        port: u16,
+        auto_port_forward_enabled: Arc<AtomicBool>,
+        auth_manager: Arc<AuthManager>,
+    ) -> Self {
+        Self {
+            port,
+            auto_port_forward_enabled,
+            auth_manager,
+        }
+    }
+
+    /// Get a reference to the auth manager
+    pub fn auth_manager(&self) -> &Arc<AuthManager> {
+        &self.auth_manager
     }
 
     /// Run the control server
@@ -113,7 +144,7 @@ async fn handle_request(
 ) -> Result<Response<String>, hyper::Error> {
     let (parts, body) = req.into_parts();
 
-    match (parts.method, parts.uri.path()) {
+    match (parts.method.clone(), parts.uri.path()) {
         (Method::POST, "/control") => {
             // Read body
             let body_bytes = match body.collect().await {
@@ -143,19 +174,101 @@ async fn handle_request(
         }
         (Method::GET, "/status") => {
             let auto_port_forward_enabled = state.auto_port_forward_enabled.load(Ordering::Relaxed);
+            let auth_enabled = state.auth_manager.is_enabled().await;
 
             let data = serde_json::json!({
                 "auto_port_forward_enabled": auto_port_forward_enabled,
+                "auth_enabled": auth_enabled,
             });
 
             let response = ControlResponse::success_with_data("Status retrieved", data);
             Ok(json_response(StatusCode::OK, response))
+        }
+        // Auth configuration endpoints
+        (Method::POST, "/auth/configure") => {
+            handle_auth_configure(body, state).await
+        }
+        (Method::GET, "/auth/config") => {
+            handle_auth_get_config(state).await
+        }
+        (Method::DELETE, "/auth/configure") => {
+            handle_auth_disable(state).await
         }
         _ => {
             let response = ControlResponse::error("Not found");
             Ok(json_response(StatusCode::NOT_FOUND, response))
         }
     }
+}
+
+/// Handle POST /auth/configure
+async fn handle_auth_configure(
+    body: Incoming,
+    state: Arc<ControlServer>,
+) -> Result<Response<String>, hyper::Error> {
+    // Read body
+    let body_bytes = match body.collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            let response = ControlResponse::error(format!("Failed to read body: {}", e));
+            return Ok(json_response(StatusCode::BAD_REQUEST, response));
+        }
+    };
+
+    // Parse config
+    let config: AuthConfig = match serde_json::from_slice(&body_bytes) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            let response = ControlResponse::error(format!("Invalid JSON: {}", e));
+            return Ok(json_response(StatusCode::BAD_REQUEST, response));
+        }
+    };
+
+    // Validate required fields
+    if config.jwks_url.is_empty() {
+        let response = ControlResponse::error("jwks_url is required");
+        return Ok(json_response(StatusCode::BAD_REQUEST, response));
+    }
+
+    if config.issuer.is_empty() {
+        let response = ControlResponse::error("issuer is required");
+        return Ok(json_response(StatusCode::BAD_REQUEST, response));
+    }
+
+    // Configure auth
+    state.auth_manager.configure(config).await;
+
+    let response = ControlResponse::success("Auth configured successfully");
+    Ok(json_response(StatusCode::OK, response))
+}
+
+/// Handle GET /auth/config
+async fn handle_auth_get_config(
+    state: Arc<ControlServer>,
+) -> Result<Response<String>, hyper::Error> {
+    match state.auth_manager.get_config().await {
+        Some(config) => {
+            let data = serde_json::to_value(&config).unwrap_or(serde_json::json!({}));
+            let response = ControlResponse::success_with_data("Auth configuration retrieved", data);
+            Ok(json_response(StatusCode::OK, response))
+        }
+        None => {
+            let response = ControlResponse::success_with_data(
+                "Auth not configured",
+                serde_json::json!({ "enabled": false }),
+            );
+            Ok(json_response(StatusCode::OK, response))
+        }
+    }
+}
+
+/// Handle DELETE /auth/configure
+async fn handle_auth_disable(
+    state: Arc<ControlServer>,
+) -> Result<Response<String>, hyper::Error> {
+    state.auth_manager.disable().await;
+    let response = ControlResponse::success("Auth disabled");
+    Ok(json_response(StatusCode::OK, response))
 }
 
 /// Handle a control command
