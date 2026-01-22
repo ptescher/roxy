@@ -10,7 +10,7 @@ mod theme;
 
 use gpui::prelude::*;
 use gpui::{KeyBinding, *};
-use roxy_core::{ClickHouseConfig, RoxyClickHouse, CURRENT_VERSION};
+use roxy_core::{ClickHouseConfig, RoxyClickHouse, RoxyConfig, CURRENT_VERSION};
 
 #[cfg(target_os = "macos")]
 use cocoa::{
@@ -21,7 +21,7 @@ use cocoa::{
 #[cfg(target_os = "macos")]
 use objc::{class, msg_send, sel, sel_impl};
 
-use roxy_proxy::{system_proxy, ActiveK8sConnections, ProxyConfig, ProxyServer};
+use roxy_proxy::{system_proxy, tls::{TlsConfig, TlsInterceptionMode}, ActiveK8sConnections, ProxyConfig, ProxyServer};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,8 +99,34 @@ impl RoxyApp {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(async move {
+                // Load configuration from config.toml
+                let roxy_config = RoxyConfig::load_with_env().unwrap_or_default();
+
+                // Build TLS config from the loaded configuration
+                let tls_config = if roxy_config.proxy.enable_tls_interception && !roxy_config.tls.intercept_hosts.is_empty() {
+                    let mode = match roxy_config.tls.mode.as_str() {
+                        "InterceptListed" => TlsInterceptionMode::InterceptListed,
+                        "InterceptAll" => TlsInterceptionMode::InterceptAll,
+                        _ => TlsInterceptionMode::Passthrough,
+                    };
+                    tracing::info!(
+                        "TLS interception enabled (mode: {:?}) for hosts: {:?}",
+                        mode,
+                        roxy_config.tls.intercept_hosts
+                    );
+                    TlsConfig {
+                        enabled: true,
+                        mode,
+                        intercept_hosts: roxy_config.tls.intercept_hosts.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    TlsConfig::default()
+                };
+
                 let config = ProxyConfig {
                     start_services: true,
+                    tls: tls_config,
                     ..Default::default()
                 };
 
