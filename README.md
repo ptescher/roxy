@@ -2,6 +2,8 @@
 
 A fast, efficient, local network debugging tool built with Rust.
 
+**[🌐 Website](https://roxyproxy.io)** | **[📖 Documentation](#quick-start)** | **[🐛 Issues](https://github.com/ptescher/roxy/issues)**
+
 ## Overview
 
 Roxy is a modern alternative to tools like Proxyman or Charles Proxy. It intercepts HTTP/HTTPS traffic from your local machine, instruments it with OpenTelemetry traces, stores everything in ClickHouse, and displays it in a native GPU-accelerated UI.
@@ -174,7 +176,7 @@ All data is stored locally in `~/.roxy/`.
 ### 1. Clone and Build
 
 ```bash
-git clone https://github.com/yourusername/roxy.git
+git clone https://github.com/ptescher/roxy.git
 cd roxy
 
 # Build all crates

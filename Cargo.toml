@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Roxy Contributors"]
-repository = "https://github.com/yourusername/roxy"
+repository = "https://github.com/ptescher/roxy"
 
 [workspace.dependencies]
 # Async runtime

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 /// GitHub repository for Roxy releases
-const GITHUB_REPO: &str = "yourusername/roxy";
+const GITHUB_REPO: &str = "ptescher/roxy";
 
 /// Current version of Roxy (from Cargo.toml)
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
