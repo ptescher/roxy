@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Roxy - A fast, modern network debugging tool for full-stack local development. Built with Rust for maximum performance.">
+    <title>Roxy - Modern Network Debugging for Full-Stack Development</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <div class="logo">
+                <h1>Roxy</h1>
+                <p class="tagline">Modern Network Debugging for Local Development</p>
+            </div>
+            <nav>
+                <a href="#features">Features</a>
+                <a href="#how-it-works">How It Works</a>
+                <a href="#getting-started">Get Started</a>
+                <a href="https://github.com/ptescher/roxy" class="github-link">GitHub</a>
+            </nav>
+        </div>
+    </header>
+
+    <main>
+        <section class="hero">
+            <div class="container">
+                <h2>Build Full-Stack Apps Locally with Confidence</h2>
+                <p class="hero-description">
+                    Roxy is a fast, modern alternative to Proxyman and Charles Proxy.
+                    Route API calls between local services and production, connect to Kubernetes databases,
+                    and debug your entire stack—all from a native macOS app.
+                </p>
+                <div class="cta-buttons">
+                    <a href="https://github.com/ptescher/roxy" class="btn btn-primary">Download for macOS</a>
+                    <a href="#how-it-works" class="btn btn-secondary">See How It Works</a>
+                </div>
+                <p class="platform-note">Built with Rust for speed and reliability</p>
+            </div>
+        </section>
+
+        <section id="features" class="features">
+            <div class="container">
+                <h2>Perfect for Full-Stack Development</h2>
+                <div class="feature-grid">
+                    <div class="feature-card">
+                        <div class="feature-icon">🚀</div>
+                        <h3>Fast & Native</h3>
+                        <p>GPU-accelerated native macOS UI. No Electron bloat. HTTP/HTTPS proxy with TLS interception built in Rust.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-icon">🎯</div>
+                        <h3>Visual Routing Rules</h3>
+                        <p>Route specific API paths to your local dev server through the GUI. No config files needed—just point and click.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-icon">☸️</div>
+                        <h3>Kubernetes Integration</h3>
+                        <p>Automatic port-forwards and service discovery. Connect your local app to PostgreSQL, Kafka, and other services in your K8s cluster.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-icon">📦</div>
+                        <h3>Fully Self-Contained</h3>
+                        <p>No Docker required. ClickHouse and OpenTelemetry Collector are downloaded and managed automatically.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-icon">🔍</div>
+                        <h3>Deep Observability</h3>
+                        <p>See every HTTP request, database query, and Kafka message. OpenTelemetry-native tracing with historical data.</p>
+                    </div>
+                    <div class="feature-card">
+                        <div class="feature-icon">🤖</div>
+                        <h3>AI Agent Ready</h3>
+                        <p>Built-in MCP server lets Claude and other AI agents query your network traffic and help debug issues.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="how-it-works" class="how-it-works">
+            <div class="container">
+                <h2>How It Works</h2>
+                <p class="section-intro">Roxy sits between your development environment and the outside world, giving you complete visibility and control.</p>
+
+                <div class="architecture-diagram">
+                    <div class="diagram-section">
+                        <h3>Your Local Development</h3>
+                        <div class="diagram-box">
+                            <div class="component">
+                                <strong>React Native App</strong>
+                                <span class="port">iOS Simulator</span>
+                            </div>
+                            <div class="arrow-down">↓</div>
+                            <div class="component">
+                                <strong>NestJS Backend</strong>
+                                <span class="port">localhost:3000</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="diagram-connector">
+                        <div class="connector-line"></div>
+                        <div class="connector-label">All traffic flows through</div>
+                    </div>
+
+                    <div class="diagram-section roxy-section">
+                        <h3>Roxy Proxy</h3>
+                        <div class="diagram-box highlight">
+                            <div class="component">
+                                <strong>HTTP/HTTPS Proxy</strong>
+                                <span class="port">Port 8080</span>
+                            </div>
+                            <div class="feature-list">
+                                <div class="feature-item">✓ TLS Interception</div>
+                                <div class="feature-item">✓ Smart Routing Rules</div>
+                                <div class="feature-item">✓ Request/Response Capture</div>
+                            </div>
+                            <div class="component">
+                                <strong>SOCKS5 Proxy</strong>
+                                <span class="port">Port 1080</span>
+                            </div>
+                            <div class="feature-list">
+                                <div class="feature-item">✓ Database Connections</div>
+                                <div class="feature-item">✓ Auto K8s Port-Forwards</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="diagram-connector">
+                        <div class="connector-line"></div>
+                        <div class="connector-label">Routes to</div>
+                    </div>
+
+                    <div class="diagram-section">
+                        <h3>External Services</h3>
+                        <div class="diagram-box">
+                            <div class="component">
+                                <strong>Production API</strong>
+                                <span class="port">api.example.com</span>
+                            </div>
+                            <div class="arrow-down">↓</div>
+                            <div class="component">
+                                <strong>Kubernetes</strong>
+                                <span class="port">PostgreSQL, Kafka</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="use-case">
+                    <h3>Common Development Scenario</h3>
+                    <div class="scenario-cards">
+                        <div class="scenario-card">
+                            <div class="step-number">1</div>
+                            <h4>Set Up Routing Rules</h4>
+                            <p>Route <code>api.example.com/v1/new-feature/*</code> to your local NestJS server on port 3000</p>
+                        </div>
+                        <div class="scenario-card">
+                            <div class="step-number">2</div>
+                            <h4>Connect to K8s Services</h4>
+                            <p>Auto port-forward to <code>postgres.backend.svc.cluster.local</code> when your app connects</p>
+                        </div>
+                        <div class="scenario-card">
+                            <div class="step-number">3</div>
+                            <h4>Test Your Feature</h4>
+                            <p>Your mobile app calls production APIs for everything except your new feature—which hits your local server</p>
+                        </div>
+                        <div class="scenario-card">
+                            <div class="step-number">4</div>
+                            <h4>Debug with Visibility</h4>
+                            <p>See every request, response, SQL query, and Kafka message in real-time</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section id="getting-started" class="getting-started">
+            <div class="container">
+                <h2>Get Started in Minutes</h2>
+                <div class="install-steps">
+                    <div class="step">
+                        <h3>1. Clone and Build</h3>
+                        <pre><code>git clone https://github.com/ptescher/roxy.git
+cd roxy
+cargo build --release</code></pre>
+                    </div>
+                    <div class="step">
+                        <h3>2. Run Roxy</h3>
+                        <pre><code>cargo run --release --bin roxy</code></pre>
+                        <p>On first run, Roxy automatically downloads ClickHouse and OpenTelemetry Collector.</p>
+                    </div>
+                    <div class="step">
+                        <h3>3. Trust the CA Certificate</h3>
+                        <p>Import <code>~/.roxy/ca.crt</code> into macOS Keychain and set trust to "Always Trust"</p>
+                    </div>
+                    <div class="step">
+                        <h3>4. Configure Your Apps</h3>
+                        <pre><code># For your backend
+HTTP_PROXY=http://localhost:8080 npm run dev
+
+# For your mobile app
+# Set iOS Simulator proxy to localhost:8080</code></pre>
+                    </div>
+                </div>
+
+                <div class="tech-stack">
+                    <h3>Built With</h3>
+                    <div class="tech-items">
+                        <div class="tech-item">Rust</div>
+                        <div class="tech-item">GPUI (Zed's UI Framework)</div>
+                        <div class="tech-item">ClickHouse</div>
+                        <div class="tech-item">OpenTelemetry</div>
+                        <div class="tech-item">Kubernetes Client</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="cta-footer">
+            <div class="container">
+                <h2>Ready to Streamline Your Local Development?</h2>
+                <p>Join developers using Roxy for full-stack development with Kubernetes</p>
+                <div class="cta-buttons">
+                    <a href="https://github.com/ptescher/roxy" class="btn btn-primary">View on GitHub</a>
+                    <a href="https://github.com/ptescher/roxy#readme" class="btn btn-secondary">Read the Docs</a>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 Roxy Contributors. Released under the MIT License.</p>
+            <div class="footer-links">
+                <a href="https://github.com/ptescher/roxy">GitHub</a>
+                <a href="https://github.com/ptescher/roxy/issues">Issues</a>
+                <a href="https://github.com/ptescher/roxy#readme">Documentation</a>
+            </div>
+        </div>
+    </footer>
+</body>
+</html>
