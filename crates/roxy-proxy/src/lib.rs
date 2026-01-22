@@ -1834,6 +1834,15 @@ impl ProxyServer {
             }
         });
 
+        // Pre-initialize gateway router to avoid blocking first request
+        {
+            let mut gateway_router = self.state.gateway_router.lock().await;
+            if let Err(e) = gateway_router.initialize().await {
+                warn!("Failed to initialize gateway router: {}", e);
+                warn!("Gateway routing will initialize on first request");
+            }
+        }
+
         info!("=================================================");
         info!("  Roxy Proxy is running!");
         info!("  HTTP Proxy: http://127.0.0.1:{}", self.config.port);

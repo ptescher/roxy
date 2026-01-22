@@ -13,7 +13,7 @@ use kube::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// How often to refresh HTTPRoute cache (in seconds)
 const ROUTE_CACHE_TTL_SECS: u64 = 30;
@@ -319,6 +319,32 @@ impl GatewayRouter {
             client: None,
             route_cache: Arc::new(RwLock::new(None)),
             gateway_api_available: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    /// Initialize the gateway router by pre-fetching Kubernetes client and HTTPRoutes
+    /// This should be called during startup to avoid blocking the first request.
+    /// Returns an error if initialization fails, but the router will still work
+    /// (it will lazily initialize on first request).
+    pub async fn initialize(&mut self) -> Result<(), GatewayError> {
+        debug!("Pre-initializing gateway router...");
+
+        // Initialize Kubernetes client
+        if let Err(e) = self.get_client().await {
+            warn!("Failed to initialize Kubernetes client: {}", e);
+            return Err(e);
+        }
+
+        // Pre-fetch HTTPRoutes
+        match self.fetch_routes().await {
+            Ok(routes) => {
+                info!("Gateway router initialized with {} HTTPRoutes", routes.len());
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Failed to pre-fetch HTTPRoutes: {}", e);
+                Err(e)
+            }
         }
     }
 
