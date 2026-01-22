@@ -24,6 +24,10 @@ pub struct RoxyConfig {
     /// Proxy configuration
     #[serde(default)]
     pub proxy: ProxyConfig,
+
+    /// TLS interception configuration
+    #[serde(default)]
+    pub tls: TlsSettings,
 }
 
 /// Datadog API configuration
@@ -143,6 +147,33 @@ fn default_true() -> bool {
     true
 }
 
+/// TLS interception configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsSettings {
+    /// TLS interception mode: "Passthrough", "InterceptListed", or "InterceptAll"
+    #[serde(default = "default_tls_mode")]
+    pub mode: String,
+
+    /// List of hosts to intercept TLS for (when mode is InterceptListed)
+    /// or exclude from interception (when mode is InterceptAll)
+    /// Supports exact matches and wildcard patterns like `*.example.com`
+    #[serde(default)]
+    pub intercept_hosts: Vec<String>,
+}
+
+impl Default for TlsSettings {
+    fn default() -> Self {
+        Self {
+            mode: default_tls_mode(),
+            intercept_hosts: Vec::new(),
+        }
+    }
+}
+
+fn default_tls_mode() -> String {
+    "Passthrough".to_string()
+}
+
 impl RoxyConfig {
     /// Get the config file path for the current OS
     pub fn config_path() -> Result<PathBuf> {
@@ -230,6 +261,8 @@ mod tests {
         assert_eq!(config.datadog.site, "datadoghq.com");
         assert_eq!(config.proxy.http_port, 8080);
         assert_eq!(config.proxy.socks_port, 1080);
+        assert_eq!(config.tls.mode, "Passthrough");
+        assert!(config.tls.intercept_hosts.is_empty());
     }
 
     #[test]
@@ -238,5 +271,19 @@ mod tests {
         let toml = toml::to_string_pretty(&config).unwrap();
         let parsed: RoxyConfig = toml::from_str(&toml).unwrap();
         assert_eq!(parsed.datadog.site, config.datadog.site);
+        assert_eq!(parsed.tls.mode, config.tls.mode);
+    }
+
+    #[test]
+    fn test_tls_config_with_hosts() {
+        let toml_str = r#"
+[tls]
+mode = "InterceptListed"
+intercept_hosts = ["*.example.org", "api.example.com"]
+"#;
+        let config: RoxyConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.tls.mode, "InterceptListed");
+        assert_eq!(config.tls.intercept_hosts.len(), 2);
+        assert!(config.tls.intercept_hosts.contains(&"*.example.org".to_string()));
     }
 }

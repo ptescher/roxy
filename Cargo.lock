@@ -5763,6 +5763,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "clap",
  "dirs 6.0.0",
  "futures",
  "http 1.4.0",
