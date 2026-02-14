@@ -1,0 +1,33 @@
+[package]
+name = "roxy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for Roxy proxy — run proxy, launch sandboxed containers"
+
+[[bin]]
+name = "roxy"
+path = "src/main.rs"
+
+[dependencies]
+# Internal
+roxy-core = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

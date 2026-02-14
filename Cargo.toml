@@ -5,6 +5,7 @@ members = [
     "crates/roxy-ui",
     "crates/roxy-core",
     "crates/roxy-mcp",
+    "crates/roxy-cli",
     "xtask",
 ]
 exclude = [
@@ -71,6 +72,9 @@ k8s-openapi = { version = "0.20", features = ["v1_28"] }
 
 # SOCKS proxy support
 tokio-socks = "0.5"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
 
 # Internal crates
 roxy-core = { path = "crates/roxy-core" }

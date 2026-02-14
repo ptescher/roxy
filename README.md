@@ -865,6 +865,7 @@ For code signing and notarization (required for distribution), set these environ
 - [x] Platform detection (macOS, Linux)
 - [x] Update checking from GitHub releases
 - [x] MCP server for AI agent integration (query spans, HTTP requests, database queries)
+- [x] `roxy sandbox` — Docker sandbox with proxy routing for agentic coding
 - [ ] MCP server routing configuration tools
 - [ ] Kubernetes watch API for real-time resource updates (replace polling)
 - [ ] Automatic update installation
