@@ -273,12 +273,25 @@ impl Sidebar {
     fn render_empty_state(&self) -> impl IntoElement {
         div()
             .flex()
+            .flex_col()
             .items_center()
             .justify_center()
-            .h(px(100.0))
-            .text_size(font_size::SM)
-            .text_color(self.theme.text_muted)
-            .child("No hosts yet")
+            .h(px(120.0))
+            .px(spacing::MD)
+            .gap(spacing::XXS)
+            .child(
+                div()
+                    .text_size(font_size::SM)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(self.theme.text_secondary)
+                    .child("No hosts captured"),
+            )
+            .child(
+                div()
+                    .text_size(font_size::XS)
+                    .text_color(self.theme.text_muted)
+                    .child("Intercepted traffic will appear here"),
+            )
     }
 }
 
