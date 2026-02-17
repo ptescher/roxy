@@ -3,6 +3,7 @@
 //! This module contains the core state management types including
 //! the application state, UI messages, and proxy status.
 
+use chrono::Utc;
 use crate::components::{
     ConnectionDetailTab, DatabaseDetailTab, DetailTab, HttpRouteInfo, K8sBackendRef, K8sGateway,
     K8sGatewayListener, K8sHttpRoute, K8sIngress, K8sParentRef, K8sService, K8sServicePort,
@@ -417,6 +418,10 @@ pub struct AppState {
 
     /// Whether Kubernetes resources are currently loading
     pub kube_loading: bool,
+
+    /// Timestamp of the last clear action (millis)
+    /// Data older than this will be filtered out
+    pub clear_timestamp: i64,
 }
 
 impl AppState {
@@ -488,6 +493,7 @@ impl AppState {
             kube_namespaces_scroll_handle: ScrollHandle::new(),
             context_dropdown_expanded: false,
             kube_loading: false,
+            clear_timestamp: 0,
         }
     }
 
@@ -517,15 +523,22 @@ impl AppState {
     fn handle_message(&mut self, msg: UiMessage) {
         match msg {
             UiMessage::RequestsUpdated(requests) => {
-                self.requests = requests;
+                self.requests = requests
+                    .into_iter()
+                    .filter(|r| r.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::HostsUpdated(hosts) => {
-                self.hosts = hosts;
+                self.hosts = hosts
+                    .into_iter()
+                    .filter(|h| h.last_seen >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::ServicesUpdated(client_services) => {
                 // Convert ClientServiceSummary to ServiceSummary for UI
                 self.services = client_services
                     .into_iter()
+                    .filter(|cs| cs.last_seen >= self.clear_timestamp)
                     .map(|cs| ServiceSummary {
                         name: cs.client_name,
                         request_count: cs.request_count,
@@ -535,19 +548,34 @@ impl AppState {
                     .collect();
             }
             UiMessage::RumViewsUpdated(views) => {
-                self.rum_views = views;
+                self.rum_views = views
+                    .into_iter()
+                    .filter(|v| v.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::RumResourcesUpdated(resources) => {
-                self.rum_resources = resources;
+                self.rum_resources = resources
+                    .into_iter()
+                    .filter(|r| r.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::ConnectionsUpdated(connections) => {
-                self.tcp_connections = connections;
+                self.tcp_connections = connections
+                    .into_iter()
+                    .filter(|c| c.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::DatabaseQueriesUpdated(queries) => {
-                self.database_queries = queries;
+                self.database_queries = queries
+                    .into_iter()
+                    .filter(|q| q.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::KafkaMessagesUpdated(messages) => {
-                self.kafka_messages = messages;
+                self.kafka_messages = messages
+                    .into_iter()
+                    .filter(|m| m.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::ProxyStarted => {
                 self.proxy_status = ProxyStatus::Running;
@@ -638,9 +666,20 @@ impl AppState {
 
     /// Clear all captured requests and hosts
     pub fn clear(&mut self) {
+        self.clear_timestamp = Utc::now().timestamp_millis();
         self.requests.clear();
         self.hosts.clear();
+        self.tcp_connections.clear();
+        self.database_queries.clear();
+        self.kafka_messages.clear();
+        self.rum_views.clear();
+        self.rum_resources.clear();
+        self.services.clear();
         self.selected_request = None;
+        self.selected_connection = None;
+        self.selected_database_query = None;
+        self.selected_kafka_message = None;
+        self.selected_rum_view = None;
         self.selected_host = None;
         self.selected_broker = None;
         self.selected_db_host = None;
@@ -1700,5 +1739,64 @@ mod tests {
         state.clear();
         assert!(state.requests.is_empty());
         assert!(state.hosts.is_empty());
+        assert!(state.clear_timestamp > 0);
+    }
+
+    #[test]
+    fn test_app_state_clear_persistent() {
+        let mut state = AppState::new();
+
+        // Add some "old" data
+        let old_timestamp = 1000;
+        let mut old_request = HttpRequestRecord {
+            id: "1".into(),
+            trace_id: "".into(),
+            span_id: "".into(),
+            timestamp: old_timestamp,
+            method: "GET".into(),
+            url: "http://example.com".into(),
+            host: "example.com".into(),
+            path: "/".into(),
+            query: "".into(),
+            request_headers: "{}".into(),
+            request_body: "".into(),
+            request_body_size: 0,
+            response_status: 200,
+            response_headers: "{}".into(),
+            response_body: "".into(),
+            response_body_size: 0,
+            duration_ms: 10.0,
+            error: "".into(),
+            client_ip: "".into(),
+            server_ip: "".into(),
+            protocol: "HTTP/1.1".into(),
+            tls_version: "".into(),
+            client_name: "".into(),
+        };
+
+        state.requests.push(old_request.clone());
+
+        // Clear state - this sets clear_timestamp to "now"
+        state.clear();
+        assert!(state.requests.is_empty());
+        assert!(state.clear_timestamp > old_timestamp);
+
+        // Simulate a poll that returns the same old data
+        let requests = vec![old_request.clone()];
+        state.handle_message(UiMessage::RequestsUpdated(requests));
+
+        // Data should still be empty because it's older than clear_timestamp
+        assert!(state.requests.is_empty());
+
+        // Simulate a poll that returns new data
+        let new_timestamp = state.clear_timestamp + 1000;
+        old_request.id = "2".into();
+        old_request.timestamp = new_timestamp;
+        let requests = vec![old_request];
+        state.handle_message(UiMessage::RequestsUpdated(requests));
+
+        // New data should be present
+        assert_eq!(state.requests.len(), 1);
+        assert_eq!(state.requests[0].id, "2");
     }
 }

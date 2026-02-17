@@ -867,26 +867,66 @@ impl RoxyApp {
                     .child(self.render_view_tab(ViewMode::Messaging, view_mode, cx))
                     .child(self.render_view_tab(ViewMode::TCP, view_mode, cx)),
             )
-            // Right side - count for current view
+            // Right side - count for current view and Clear button
             .child(
                 div()
-                    .text_size(font_size::SM)
-                    .text_color(rgb(colors::SUBTEXT_0))
-                    .child(match view_mode {
-                        ViewMode::Requests => format!("{} requests", self.state.request_count()),
-                        ViewMode::Database => {
-                            format!("{} queries", self.state.database_queries.len())
-                        }
-                        ViewMode::Messaging => {
-                            format!("{} messages", self.state.kafka_messages.len())
-                        }
-                        ViewMode::TCP => {
-                            format!("{} connections", self.state.tcp_connections.len())
-                        }
-                        ViewMode::Kubernetes => String::new(), // Not shown in toolbar mode
-                        ViewMode::RumViews => String::new(),   // Not shown in toolbar mode
-                    }),
+                    .flex()
+                    .items_center()
+                    .gap(spacing::MD)
+                    .child(
+                        div()
+                            .text_size(font_size::SM)
+                            .text_color(rgb(colors::SUBTEXT_0))
+                            .child(match view_mode {
+                                ViewMode::Requests => format!("{} requests", self.state.request_count()),
+                                ViewMode::Database => {
+                                    format!("{} queries", self.state.database_queries.len())
+                                }
+                                ViewMode::Messaging => {
+                                    format!("{} messages", self.state.kafka_messages.len())
+                                }
+                                ViewMode::TCP => {
+                                    format!("{} connections", self.state.tcp_connections.len())
+                                }
+                                ViewMode::Kubernetes => String::new(), // Not shown in toolbar mode
+                                ViewMode::RumViews => String::new(),   // Not shown in toolbar mode
+                            }),
+                    )
+                    .child(self.render_clear_button(cx)),
             )
+    }
+
+    /// Render the Clear button
+    fn render_clear_button(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let view_mode = self.state.view_mode;
+        // Don't show clear button in Kubernetes or RUM views for now
+        if view_mode == ViewMode::Kubernetes || view_mode == ViewMode::RumViews {
+            return div().into_any_element();
+        }
+
+        div()
+            .px(spacing::SM)
+            .py(spacing::XS)
+            .rounded(dimensions::BORDER_RADIUS)
+            .cursor_pointer()
+            .tab_index(0)
+            .text_size(font_size::SM)
+            .text_color(rgb(colors::SUBTEXT_0))
+            .hover(|style| {
+                style
+                    .bg(rgb(colors::SURFACE_0))
+                    .text_color(rgb(colors::TEXT))
+            })
+            .focus(|style| {
+                style
+                    .border_1()
+                    .border_color(rgb(colors::BLUE))
+            })
+            .child("Clear (⌘K)")
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                cx.dispatch_action(&ClearRequests);
+            })
+            .into_any_element()
     }
 
     /// Render a view mode tab button
@@ -1606,8 +1646,18 @@ fn main() {
             open_about_window(cx);
         });
 
-        cx.on_action(|_: &ClearRequests, _cx| {
+        cx.on_action(|_: &ClearRequests, cx| {
             tracing::info!("Clear requests action triggered");
+            for window in cx.windows() {
+                let _ = window.update(cx, |view, _window, cx| {
+                    if let Ok(app_view) = view.downcast::<RoxyApp>() {
+                        app_view.update(cx, |app, cx| {
+                            app.state.clear();
+                            cx.notify();
+                        });
+                    }
+                });
+            }
         });
 
         cx.on_action(|_: &ToggleProxy, _cx| {
