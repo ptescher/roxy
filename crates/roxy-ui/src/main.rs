@@ -861,11 +861,18 @@ impl RoxyApp {
                 div()
                     .flex()
                     .items_center()
-                    .gap(spacing::XXS)
-                    .child(self.render_view_tab(ViewMode::Requests, view_mode, cx))
-                    .child(self.render_view_tab(ViewMode::Database, view_mode, cx))
-                    .child(self.render_view_tab(ViewMode::Messaging, view_mode, cx))
-                    .child(self.render_view_tab(ViewMode::TCP, view_mode, cx)),
+                    .gap(spacing::MD)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(spacing::XXS)
+                            .child(self.render_view_tab(ViewMode::Requests, view_mode, cx))
+                            .child(self.render_view_tab(ViewMode::Database, view_mode, cx))
+                            .child(self.render_view_tab(ViewMode::Messaging, view_mode, cx))
+                            .child(self.render_view_tab(ViewMode::TCP, view_mode, cx)),
+                    )
+                    .child(self.render_clear_button(cx)),
             )
             // Right side - count for current view
             .child(
@@ -930,6 +937,43 @@ impl RoxyApp {
                     app.state.set_view_mode(mode);
                     cx.notify();
                 });
+            })
+    }
+
+    /// Render the clear button
+    fn render_clear_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().clone();
+
+        div()
+            .id("toolbar-clear-button")
+            .px(spacing::SM)
+            .py(px(6.0))
+            .rounded(dimensions::BORDER_RADIUS)
+            .bg(rgb(colors::SURFACE_0))
+            .text_size(font_size::SM)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(colors::SUBTEXT_0))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(colors::SURFACE_1)).text_color(rgb(colors::TEXT)))
+            .active(|style| style.bg(rgb(colors::SURFACE_2)))
+            .child("Clear")
+            .tab_index(0)
+            .on_mouse_down(MouseButton::Left, {
+                let entity = entity.clone();
+                move |_event, _window, cx| {
+                    entity.update(cx, |app, cx| {
+                        app.state.clear();
+                        cx.notify();
+                    });
+                }
+            })
+            .on_key_down(move |event, _window, cx| {
+                if event.keystroke.key == "enter" || event.keystroke.key == " " {
+                    entity.update(cx, |app, cx| {
+                        app.state.clear();
+                        cx.notify();
+                    });
+                }
             })
     }
 
@@ -1606,8 +1650,18 @@ fn main() {
             open_about_window(cx);
         });
 
-        cx.on_action(|_: &ClearRequests, _cx| {
+        cx.on_action(|_: &ClearRequests, cx| {
             tracing::info!("Clear requests action triggered");
+            for window in cx.windows() {
+                let _ = window.update(cx, |view, _window, cx| {
+                    if let Ok(app) = view.downcast::<RoxyApp>() {
+                        app.update(cx, |app: &mut RoxyApp, cx| {
+                            app.state.clear();
+                            cx.notify();
+                        });
+                    }
+                });
+            }
         });
 
         cx.on_action(|_: &ToggleProxy, _cx| {
