@@ -464,7 +464,15 @@ async fn handle_tls_intercept(
     debug!(host = %host, "TLS handshake complete with target server");
 
     // Now we have decrypted streams on both sides - run HTTP proxy between them
-    run_https_proxy(tls_stream, target_tls, host, client_addr, clickhouse, auth_manager).await
+    run_https_proxy(
+        tls_stream,
+        target_tls,
+        host,
+        client_addr,
+        clickhouse,
+        auth_manager,
+    )
+    .await
 }
 
 /// Run HTTP proxy between decrypted TLS streams
@@ -1810,7 +1818,8 @@ impl ProxyServer {
 
         // Create a system proxy guard that will clear the proxy on drop
         // This ensures cleanup even if we exit unexpectedly
-        let mut _proxy_guard = SystemProxyGuard::new(self.config.port, self.config.configure_system_proxy);
+        let mut _proxy_guard =
+            SystemProxyGuard::new(self.config.port, self.config.configure_system_proxy);
 
         // Start SOCKS5 proxy in a separate task if enabled
         if let Some(socks) = &self.socks_proxy {
@@ -1900,13 +1909,14 @@ impl ProxyServer {
     async fn run_accept_loop(&self, listener: TcpListener) -> &'static str {
         // Set up SIGTERM handler for Unix systems
         #[cfg(unix)]
-        let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                warn!("Failed to register SIGTERM handler: {}", e);
-                None
-            }
-        };
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Failed to register SIGTERM handler: {}", e);
+                    None
+                }
+            };
 
         loop {
             #[cfg(unix)]
@@ -1960,7 +1970,10 @@ impl ProxyServer {
     }
 
     /// Handle a single accepted connection
-    async fn handle_accepted_connection(&self, accept_result: std::io::Result<(TcpStream, SocketAddr)>) {
+    async fn handle_accepted_connection(
+        &self,
+        accept_result: std::io::Result<(TcpStream, SocketAddr)>,
+    ) {
         match accept_result {
             Ok((stream, client_addr)) => {
                 let io = TokioIo::new(stream);
@@ -1988,8 +2001,6 @@ impl ProxyServer {
             }
         }
     }
-
-
 
     /// Check if the proxy is currently running
     pub fn is_running(&self) -> bool {

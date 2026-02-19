@@ -29,9 +29,7 @@
 //!   }'
 //! ```
 
-use jsonwebtoken::{
-    decode, decode_header, jwk::JwkSet, DecodingKey, TokenData, Validation,
-};
+use jsonwebtoken::{decode, decode_header, jwk::JwkSet, DecodingKey, TokenData, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -263,8 +261,7 @@ impl AuthManager {
     async fn fetch_jwks(&self) -> Result<JwkSet, AuthError> {
         let config = {
             let cfg = self.config.read().await;
-            cfg.clone()
-                .ok_or(AuthError::NotConfigured)?
+            cfg.clone().ok_or(AuthError::NotConfigured)?
         };
 
         debug!(url = %config.jwks_url, "Fetching JWKS");
@@ -322,9 +319,7 @@ impl AuthManager {
                 }
 
                 // If last fetch failed, use shorter retry delay
-                if !cached.fetch_succeeded
-                    && elapsed < Duration::from_secs(JWKS_RETRY_DELAY_SECS)
-                {
+                if !cached.fetch_succeeded && elapsed < Duration::from_secs(JWKS_RETRY_DELAY_SECS) {
                     // Return cached version even if stale
                     return Ok(cached.jwks.clone());
                 }
@@ -385,7 +380,11 @@ impl AuthManager {
     }
 
     /// Find the decoding key for a JWT based on its header
-    fn find_key(&self, header: &jsonwebtoken::Header, jwks: &JwkSet) -> Result<DecodingKey, AuthError> {
+    fn find_key(
+        &self,
+        header: &jsonwebtoken::Header,
+        jwks: &JwkSet,
+    ) -> Result<DecodingKey, AuthError> {
         // If the token has a kid, look for that specific key
         if let Some(kid) = &header.kid {
             for jwk in &jwks.keys {
@@ -615,7 +614,10 @@ mod tests {
             },
         };
 
-        assert_eq!(claims.get("iss"), Some("https://auth.example.com".to_string()));
+        assert_eq!(
+            claims.get("iss"),
+            Some("https://auth.example.com".to_string())
+        );
         assert_eq!(claims.get("sub"), Some("user123".to_string()));
         assert_eq!(claims.get("email"), Some("user@example.com".to_string()));
         assert_eq!(claims.get("nonexistent"), None);
@@ -639,10 +641,13 @@ mod tests {
 
     #[test]
     fn test_auth_config_defaults() {
-        let config: AuthConfig = serde_json::from_str(r#"{
+        let config: AuthConfig = serde_json::from_str(
+            r#"{
             "jwks_url": "https://example.com/.well-known/jwks.json",
             "issuer": "https://example.com"
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         assert_eq!(config.jwks_url, "https://example.com/.well-known/jwks.json");
         assert_eq!(config.issuer, "https://example.com");

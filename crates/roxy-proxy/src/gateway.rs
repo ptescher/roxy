@@ -338,7 +338,10 @@ impl GatewayRouter {
         // Pre-fetch HTTPRoutes
         match self.fetch_routes().await {
             Ok(routes) => {
-                info!("Gateway router initialized with {} HTTPRoutes", routes.len());
+                info!(
+                    "Gateway router initialized with {} HTTPRoutes",
+                    routes.len()
+                );
                 Ok(())
             }
             Err(e) => {

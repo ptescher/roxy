@@ -10,7 +10,11 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 /// Roxy Proxy - HTTP/HTTPS proxy with selective TLS interception
 #[derive(Parser, Debug)]
-#[command(name = "roxy-proxy", version, about = "HTTP/HTTPS proxy with selective TLS interception")]
+#[command(
+    name = "roxy-proxy",
+    version,
+    about = "HTTP/HTTPS proxy with selective TLS interception"
+)]
 struct Args {
     /// Port to listen on
     #[arg(short, long, default_value = "8080")]

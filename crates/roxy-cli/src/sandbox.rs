@@ -211,7 +211,10 @@ impl SandboxRunner {
         let home = home_dir()?;
         let kubeconfig = home.join(".kube");
         if kubeconfig.exists() {
-            args.extend(["-v".into(), format!("{}:/root/.kube:ro", kubeconfig.display())]);
+            args.extend([
+                "-v".into(),
+                format!("{}:/root/.kube:ro", kubeconfig.display()),
+            ]);
         }
 
         // CA certificate (read-only)
@@ -260,7 +263,10 @@ impl SandboxRunner {
 
             let claude_dir = home.join(".claude");
             if claude_dir.exists() {
-                args.extend(["-v".into(), format!("{}:/root/.claude", claude_dir.display())]);
+                args.extend([
+                    "-v".into(),
+                    format!("{}:/root/.claude", claude_dir.display()),
+                ]);
             }
 
             // Forward API key if set
@@ -403,9 +409,7 @@ mod tests {
         let runner = SandboxRunner::new(args);
         let docker_args = runner.build_docker_args("img").unwrap();
 
-        assert!(docker_args
-            .iter()
-            .any(|a| a == "ROXY_CLAUDE_CODE=true"));
+        assert!(docker_args.iter().any(|a| a == "ROXY_CLAUDE_CODE=true"));
     }
 
     #[test]

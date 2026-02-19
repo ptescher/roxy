@@ -185,15 +185,9 @@ async fn handle_request(
             Ok(json_response(StatusCode::OK, response))
         }
         // Auth configuration endpoints
-        (Method::POST, "/auth/configure") => {
-            handle_auth_configure(body, state).await
-        }
-        (Method::GET, "/auth/config") => {
-            handle_auth_get_config(state).await
-        }
-        (Method::DELETE, "/auth/configure") => {
-            handle_auth_disable(state).await
-        }
+        (Method::POST, "/auth/configure") => handle_auth_configure(body, state).await,
+        (Method::GET, "/auth/config") => handle_auth_get_config(state).await,
+        (Method::DELETE, "/auth/configure") => handle_auth_disable(state).await,
         _ => {
             let response = ControlResponse::error("Not found");
             Ok(json_response(StatusCode::NOT_FOUND, response))
@@ -263,9 +257,7 @@ async fn handle_auth_get_config(
 }
 
 /// Handle DELETE /auth/configure
-async fn handle_auth_disable(
-    state: Arc<ControlServer>,
-) -> Result<Response<String>, hyper::Error> {
+async fn handle_auth_disable(state: Arc<ControlServer>) -> Result<Response<String>, hyper::Error> {
     state.auth_manager.disable().await;
     let response = ControlResponse::success("Auth disabled");
     Ok(json_response(StatusCode::OK, response))

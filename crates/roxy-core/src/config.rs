@@ -284,6 +284,9 @@ intercept_hosts = ["*.example.org", "api.example.com"]
         let config: RoxyConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.tls.mode, "InterceptListed");
         assert_eq!(config.tls.intercept_hosts.len(), 2);
-        assert!(config.tls.intercept_hosts.contains(&"*.example.org".to_string()));
+        assert!(config
+            .tls
+            .intercept_hosts
+            .contains(&"*.example.org".to_string()));
     }
 }
