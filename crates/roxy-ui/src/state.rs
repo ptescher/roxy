@@ -3,6 +3,7 @@
 //! This module contains the core state management types including
 //! the application state, UI messages, and proxy status.
 
+use chrono::Utc;
 use crate::components::{
     ConnectionDetailTab, DatabaseDetailTab, DetailTab, HttpRouteInfo, K8sBackendRef, K8sGateway,
     K8sGatewayListener, K8sHttpRoute, K8sIngress, K8sParentRef, K8sService, K8sServicePort,
@@ -253,6 +254,10 @@ pub struct AppState {
     /// List of recent requests
     pub requests: Vec<HttpRequestRecord>,
 
+    /// Timestamp of the last clear action (milliseconds since epoch)
+    /// Data older than this is filtered out of the UI
+    pub clear_timestamp: i64,
+
     /// Currently selected host filter
     pub selected_host: Option<String>,
 
@@ -433,6 +438,7 @@ impl AppState {
             auto_port_forward_enabled: true, // Enabled by default
             hosts: Vec::new(),
             requests: Vec::new(),
+            clear_timestamp: 0,
             selected_host: None,
             selected_broker: None,
             selected_db_host: None,
@@ -517,15 +523,22 @@ impl AppState {
     fn handle_message(&mut self, msg: UiMessage) {
         match msg {
             UiMessage::RequestsUpdated(requests) => {
-                self.requests = requests;
+                self.requests = requests
+                    .into_iter()
+                    .filter(|r| r.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::HostsUpdated(hosts) => {
-                self.hosts = hosts;
+                self.hosts = hosts
+                    .into_iter()
+                    .filter(|h| h.last_seen >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::ServicesUpdated(client_services) => {
                 // Convert ClientServiceSummary to ServiceSummary for UI
                 self.services = client_services
                     .into_iter()
+                    .filter(|cs| cs.last_seen >= self.clear_timestamp)
                     .map(|cs| ServiceSummary {
                         name: cs.client_name,
                         request_count: cs.request_count,
@@ -535,19 +548,34 @@ impl AppState {
                     .collect();
             }
             UiMessage::RumViewsUpdated(views) => {
-                self.rum_views = views;
+                self.rum_views = views
+                    .into_iter()
+                    .filter(|v| v.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::RumResourcesUpdated(resources) => {
-                self.rum_resources = resources;
+                self.rum_resources = resources
+                    .into_iter()
+                    .filter(|r| r.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::ConnectionsUpdated(connections) => {
-                self.tcp_connections = connections;
+                self.tcp_connections = connections
+                    .into_iter()
+                    .filter(|c| c.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::DatabaseQueriesUpdated(queries) => {
-                self.database_queries = queries;
+                self.database_queries = queries
+                    .into_iter()
+                    .filter(|q| q.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::KafkaMessagesUpdated(messages) => {
-                self.kafka_messages = messages;
+                self.kafka_messages = messages
+                    .into_iter()
+                    .filter(|m| m.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::ProxyStarted => {
                 self.proxy_status = ProxyStatus::Running;
@@ -638,12 +666,25 @@ impl AppState {
 
     /// Clear all captured requests and hosts
     pub fn clear(&mut self) {
+        self.clear_timestamp = Utc::now().timestamp_millis();
         self.requests.clear();
         self.hosts.clear();
+        self.tcp_connections.clear();
+        self.database_queries.clear();
+        self.kafka_messages.clear();
+        self.services.clear();
+        self.rum_views.clear();
+        self.rum_resources.clear();
+
         self.selected_request = None;
         self.selected_host = None;
         self.selected_broker = None;
         self.selected_db_host = None;
+        self.selected_connection = None;
+        self.selected_database_query = None;
+        self.selected_kafka_message = None;
+        self.selected_rum_view = None;
+        self.selected_service = None;
     }
 
     /// Select a request for detail view
@@ -1696,9 +1737,13 @@ mod tests {
     #[test]
     fn test_app_state_clear() {
         let mut state = AppState::new();
-        state.error_message = Some("test".into());
+        state.clear_timestamp = 0;
         state.clear();
+        assert!(state.clear_timestamp > 0);
         assert!(state.requests.is_empty());
         assert!(state.hosts.is_empty());
+        assert!(state.tcp_connections.is_empty());
+        assert!(state.database_queries.is_empty());
+        assert!(state.kafka_messages.is_empty());
     }
 }
