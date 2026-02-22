@@ -107,7 +107,12 @@ impl StatusBar {
             .flex()
             .items_center()
             .gap(spacing::XXS)
-            .child(div().size(px(6.0)).rounded(px(3.0)).bg(status_color))
+            .child(
+                div()
+                    .size(px(6.0))
+                    .rounded(px(3.0))
+                    .bg(status_color)
+            )
             .child(format!("{}: {}", name, address))
     }
 
@@ -144,11 +149,15 @@ impl StatusBar {
             "System Proxy: OFF"
         };
 
-        div()
+        let mut el = div()
             .flex()
             .items_center()
             .gap(spacing::XS)
             .cursor_pointer()
+            .id("system-proxy-toggle")
+            .tab_index(0)
+            .rounded(px(4.0))
+            .hover(|style| style.bg(rgb(colors::SURFACE_0)))
             .child(
                 // Toggle switch
                 div()
@@ -167,12 +176,23 @@ impl StatusBar {
                             .when(enabled, |d| d.ml(px(14.0))),
                     ),
             )
-            .child(label)
-            .when_some(on_toggle, |el, callback| {
-                el.on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+            .child(label);
+
+        if let Some(callback) = on_toggle {
+            el = el.on_mouse_down(MouseButton::Left, {
+                let callback = callback.clone();
+                move |_event, _window, cx| {
                     callback(!enabled, cx);
-                })
+                }
             })
+            .on_key_down(move |event, _window, cx| {
+                if event.keystroke.key == " " || event.keystroke.key == "enter" {
+                    callback(!enabled, cx);
+                }
+            });
+        }
+
+        el
     }
 
     /// Render the auto port-forward toggle
@@ -196,11 +216,15 @@ impl StatusBar {
             "Auto K8s Port-Forward: OFF"
         };
 
-        div()
+        let mut el = div()
             .flex()
             .items_center()
             .gap(spacing::XS)
             .cursor_pointer()
+            .id("auto-port-forward-toggle")
+            .tab_index(0)
+            .rounded(px(4.0))
+            .hover(|style| style.bg(rgb(colors::SURFACE_0)))
             .child(
                 // Toggle switch
                 div()
@@ -219,12 +243,23 @@ impl StatusBar {
                             .when(enabled, |d| d.ml(px(14.0))),
                     ),
             )
-            .child(label)
-            .when_some(on_toggle, |el, callback| {
-                el.on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+            .child(label);
+
+        if let Some(callback) = on_toggle {
+            el = el.on_mouse_down(MouseButton::Left, {
+                let callback = callback.clone();
+                move |_event, _window, cx| {
                     callback(!enabled, cx);
-                })
+                }
             })
+            .on_key_down(move |event, _window, cx| {
+                if event.keystroke.key == " " || event.keystroke.key == "enter" {
+                    callback(!enabled, cx);
+                }
+            });
+        }
+
+        el
     }
 }
 

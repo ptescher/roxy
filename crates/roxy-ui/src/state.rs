@@ -14,6 +14,7 @@ use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::{DynamicObject, GroupVersionKind};
 use kube::config::Kubeconfig;
 use kube::discovery::ApiResource;
+use chrono::Utc;
 use kube::{Api, Client, Config};
 use roxy_core::{
     ClickHouseConfig, ClientServiceSummary, DatabaseQueryRow, HostSummary, HttpRequestRecord,
@@ -417,6 +418,10 @@ pub struct AppState {
 
     /// Whether Kubernetes resources are currently loading
     pub kube_loading: bool,
+
+    /// Timestamp of the last clear action (in milliseconds since epoch).
+    /// Used to filter out data from ClickHouse that was captured before clearing.
+    pub clear_timestamp: i64,
 }
 
 impl AppState {
@@ -488,6 +493,7 @@ impl AppState {
             kube_namespaces_scroll_handle: ScrollHandle::new(),
             context_dropdown_expanded: false,
             kube_loading: false,
+            clear_timestamp: 0,
         }
     }
 
@@ -517,15 +523,25 @@ impl AppState {
     fn handle_message(&mut self, msg: UiMessage) {
         match msg {
             UiMessage::RequestsUpdated(requests) => {
-                self.requests = requests;
+                // Filter out requests older than the last clear action
+                self.requests = requests
+                    .into_iter()
+                    .filter(|r| r.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::HostsUpdated(hosts) => {
-                self.hosts = hosts;
+                // Filter out hosts that haven't been seen since the last clear action
+                self.hosts = hosts
+                    .into_iter()
+                    .filter(|h| h.last_seen >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::ServicesUpdated(client_services) => {
                 // Convert ClientServiceSummary to ServiceSummary for UI
+                // Filter out services that haven't been seen since the last clear action
                 self.services = client_services
                     .into_iter()
+                    .filter(|cs| cs.last_seen >= self.clear_timestamp)
                     .map(|cs| ServiceSummary {
                         name: cs.client_name,
                         request_count: cs.request_count,
@@ -535,19 +551,39 @@ impl AppState {
                     .collect();
             }
             UiMessage::RumViewsUpdated(views) => {
-                self.rum_views = views;
+                // Filter out RUM views older than the last clear action
+                self.rum_views = views
+                    .into_iter()
+                    .filter(|v| v.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::RumResourcesUpdated(resources) => {
-                self.rum_resources = resources;
+                // Filter out RUM resources older than the last clear action
+                self.rum_resources = resources
+                    .into_iter()
+                    .filter(|r| r.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::ConnectionsUpdated(connections) => {
-                self.tcp_connections = connections;
+                // Filter out connections older than the last clear action
+                self.tcp_connections = connections
+                    .into_iter()
+                    .filter(|c| c.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::DatabaseQueriesUpdated(queries) => {
-                self.database_queries = queries;
+                // Filter out database queries older than the last clear action
+                self.database_queries = queries
+                    .into_iter()
+                    .filter(|q| q.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::KafkaMessagesUpdated(messages) => {
-                self.kafka_messages = messages;
+                // Filter out Kafka messages older than the last clear action
+                self.kafka_messages = messages
+                    .into_iter()
+                    .filter(|m| m.timestamp >= self.clear_timestamp)
+                    .collect();
             }
             UiMessage::ProxyStarted => {
                 self.proxy_status = ProxyStatus::Running;
@@ -638,9 +674,23 @@ impl AppState {
 
     /// Clear all captured requests and hosts
     pub fn clear(&mut self) {
+        // Set the clear timestamp to NOW so that polling doesn't immediately
+        // bring back the old data.
+        self.clear_timestamp = Utc::now().timestamp_millis();
+
         self.requests.clear();
         self.hosts.clear();
+        self.services.clear();
+        self.tcp_connections.clear();
+        self.database_queries.clear();
+        self.kafka_messages.clear();
+        self.rum_views.clear();
+        self.rum_resources.clear();
+
         self.selected_request = None;
+        self.selected_connection = None;
+        self.selected_database_query = None;
+        self.selected_kafka_message = None;
         self.selected_host = None;
         self.selected_broker = None;
         self.selected_db_host = None;
