@@ -869,23 +869,23 @@ impl RoxyApp {
             )
             // Right side - count for current view
             .child(
-                div()
-                    .text_size(font_size::SM)
-                    .text_color(rgb(colors::SUBTEXT_0))
-                    .child(match view_mode {
-                        ViewMode::Requests => format!("{} requests", self.state.request_count()),
-                        ViewMode::Database => {
-                            format!("{} queries", self.state.database_queries.len())
-                        }
-                        ViewMode::Messaging => {
-                            format!("{} messages", self.state.kafka_messages.len())
-                        }
-                        ViewMode::TCP => {
-                            format!("{} connections", self.state.tcp_connections.len())
-                        }
-                        ViewMode::Kubernetes => String::new(), // Not shown in toolbar mode
-                        ViewMode::RumViews => String::new(),   // Not shown in toolbar mode
-                    }),
+                div().flex().items_center().gap(spacing::MD)
+                    .child(div().px(spacing::SM).py(spacing::XXS).rounded(dimensions::BORDER_RADIUS)
+                        .cursor_pointer().text_size(font_size::SM).text_color(rgb(colors::SUBTEXT_0))
+                        .hover(|s| s.bg(rgb(colors::SURFACE_0)).text_color(rgb(colors::TEXT)))
+                        .child("Clear (⌘K)")
+                        .on_mouse_down(MouseButton::Left, {
+                            let e = cx.entity().clone();
+                            move |_, _, cx| e.update(cx, |a, cx| { a.state.clear(); cx.notify(); })
+                        }))
+                    .child(div().text_size(font_size::SM).text_color(rgb(colors::SUBTEXT_0))
+                        .child(match view_mode {
+                            ViewMode::Requests => format!("{} requests", self.state.request_count()),
+                            ViewMode::Database => format!("{} queries", self.state.database_queries.len()),
+                            ViewMode::Messaging => format!("{} messages", self.state.kafka_messages.len()),
+                            ViewMode::TCP => format!("{} connections", self.state.tcp_connections.len()),
+                            _ => String::new(),
+                        })),
             )
     }
 
@@ -1606,8 +1606,12 @@ fn main() {
             open_about_window(cx);
         });
 
-        cx.on_action(|_: &ClearRequests, _cx| {
-            tracing::info!("Clear requests action triggered");
+        cx.on_action(|_: &ClearRequests, cx| {
+            for w in cx.windows() {
+                let _ = w.update(cx, |v, _, cx| if let Ok(a) = v.downcast::<RoxyApp>() {
+                    a.update(cx, |a, cx| { a.state.clear(); cx.notify(); });
+                });
+            }
         });
 
         cx.on_action(|_: &ToggleProxy, _cx| {

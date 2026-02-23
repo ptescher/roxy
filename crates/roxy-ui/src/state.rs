@@ -417,6 +417,8 @@ pub struct AppState {
 
     /// Whether Kubernetes resources are currently loading
     pub kube_loading: bool,
+    /// Timestamp of the last clear action (milliseconds since epoch)
+    pub clear_ts: i64,
 }
 
 impl AppState {
@@ -488,6 +490,7 @@ impl AppState {
             kube_namespaces_scroll_handle: ScrollHandle::new(),
             context_dropdown_expanded: false,
             kube_loading: false,
+            clear_ts: 0,
         }
     }
 
@@ -515,13 +518,10 @@ impl AppState {
 
     /// Handle a single UI message
     fn handle_message(&mut self, msg: UiMessage) {
+        let ts = self.clear_ts;
         match msg {
-            UiMessage::RequestsUpdated(requests) => {
-                self.requests = requests;
-            }
-            UiMessage::HostsUpdated(hosts) => {
-                self.hosts = hosts;
-            }
+            UiMessage::RequestsUpdated(mut v) => { v.retain(|r| r.timestamp >= ts); self.requests = v; }
+            UiMessage::HostsUpdated(mut v) => { v.retain(|h| h.last_seen >= ts); self.hosts = v; }
             UiMessage::ServicesUpdated(client_services) => {
                 // Convert ClientServiceSummary to ServiceSummary for UI
                 self.services = client_services
@@ -540,15 +540,9 @@ impl AppState {
             UiMessage::RumResourcesUpdated(resources) => {
                 self.rum_resources = resources;
             }
-            UiMessage::ConnectionsUpdated(connections) => {
-                self.tcp_connections = connections;
-            }
-            UiMessage::DatabaseQueriesUpdated(queries) => {
-                self.database_queries = queries;
-            }
-            UiMessage::KafkaMessagesUpdated(messages) => {
-                self.kafka_messages = messages;
-            }
+            UiMessage::ConnectionsUpdated(mut v) => { v.retain(|c| c.timestamp >= ts); self.tcp_connections = v; }
+            UiMessage::DatabaseQueriesUpdated(mut v) => { v.retain(|q| q.timestamp >= ts); self.database_queries = v; }
+            UiMessage::KafkaMessagesUpdated(mut v) => { v.retain(|m| m.timestamp >= ts); self.kafka_messages = v; }
             UiMessage::ProxyStarted => {
                 self.proxy_status = ProxyStatus::Running;
                 self.error_message = None;
@@ -638,6 +632,7 @@ impl AppState {
 
     /// Clear all captured requests and hosts
     pub fn clear(&mut self) {
+        self.clear_ts = chrono::Utc::now().timestamp_millis();
         self.requests.clear();
         self.hosts.clear();
         self.selected_request = None;
