@@ -417,6 +417,10 @@ pub struct AppState {
 
     /// Whether Kubernetes resources are currently loading
     pub kube_loading: bool,
+
+    /// Timestamp of the last time the UI was cleared
+    /// Used to filter out old records from ClickHouse
+    pub clear_ts: i64,
 }
 
 impl AppState {
@@ -488,6 +492,7 @@ impl AppState {
             kube_namespaces_scroll_handle: ScrollHandle::new(),
             context_dropdown_expanded: false,
             kube_loading: false,
+            clear_ts: 0,
         }
     }
 
@@ -517,15 +522,22 @@ impl AppState {
     fn handle_message(&mut self, msg: UiMessage) {
         match msg {
             UiMessage::RequestsUpdated(requests) => {
-                self.requests = requests;
+                self.requests = requests
+                    .into_iter()
+                    .filter(|r| r.timestamp > self.clear_ts)
+                    .collect();
             }
             UiMessage::HostsUpdated(hosts) => {
-                self.hosts = hosts;
+                self.hosts = hosts
+                    .into_iter()
+                    .filter(|h| h.last_seen > self.clear_ts)
+                    .collect();
             }
             UiMessage::ServicesUpdated(client_services) => {
                 // Convert ClientServiceSummary to ServiceSummary for UI
                 self.services = client_services
                     .into_iter()
+                    .filter(|cs| cs.last_seen > self.clear_ts)
                     .map(|cs| ServiceSummary {
                         name: cs.client_name,
                         request_count: cs.request_count,
@@ -535,19 +547,34 @@ impl AppState {
                     .collect();
             }
             UiMessage::RumViewsUpdated(views) => {
-                self.rum_views = views;
+                self.rum_views = views
+                    .into_iter()
+                    .filter(|v| v.timestamp > self.clear_ts)
+                    .collect();
             }
             UiMessage::RumResourcesUpdated(resources) => {
-                self.rum_resources = resources;
+                self.rum_resources = resources
+                    .into_iter()
+                    .filter(|r| r.timestamp > self.clear_ts)
+                    .collect();
             }
             UiMessage::ConnectionsUpdated(connections) => {
-                self.tcp_connections = connections;
+                self.tcp_connections = connections
+                    .into_iter()
+                    .filter(|c| c.timestamp > self.clear_ts)
+                    .collect();
             }
             UiMessage::DatabaseQueriesUpdated(queries) => {
-                self.database_queries = queries;
+                self.database_queries = queries
+                    .into_iter()
+                    .filter(|q| q.timestamp > self.clear_ts)
+                    .collect();
             }
             UiMessage::KafkaMessagesUpdated(messages) => {
-                self.kafka_messages = messages;
+                self.kafka_messages = messages
+                    .into_iter()
+                    .filter(|m| m.timestamp > self.clear_ts)
+                    .collect();
             }
             UiMessage::ProxyStarted => {
                 self.proxy_status = ProxyStatus::Running;
@@ -640,10 +667,23 @@ impl AppState {
     pub fn clear(&mut self) {
         self.requests.clear();
         self.hosts.clear();
+        self.tcp_connections.clear();
+        self.database_queries.clear();
+        self.kafka_messages.clear();
+        self.rum_views.clear();
+        self.rum_resources.clear();
+        self.services.clear();
+
         self.selected_request = None;
         self.selected_host = None;
         self.selected_broker = None;
         self.selected_db_host = None;
+        self.selected_connection = None;
+        self.selected_database_query = None;
+        self.selected_kafka_message = None;
+
+        self.clear_ts = chrono::Utc::now().timestamp_millis();
+        info!("UI cleared at timestamp: {}", self.clear_ts);
     }
 
     /// Select a request for detail view

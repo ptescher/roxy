@@ -1,0 +1,3 @@
+## 2025-05-15 - Persistent Clear Pattern for Polling UIs
+**Learning:** In applications that poll a persistent backend (like ClickHouse) for state updates, a simple UI-side clear is insufficient as the next poll will immediately repopulate the UI with old data. Implementing a `clear_ts` and filtering incoming records by `timestamp > clear_ts` is a robust way to ensure the "Clear" action feels immediate and permanent to the user without needing destructive backend operations.
+**Action:** Always check if a UI uses polling or snapshots before implementing "Clear" or "Delete" actions. Use timestamp-based filtering for a "soft clear" that persists across polls.
